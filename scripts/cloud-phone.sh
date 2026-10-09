@@ -15,6 +15,7 @@ ARCH="${ARCH:-x86_64}"
 TARGET="${TARGET:-google_apis}"
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
+AVD_NAME="cloudphone"
 
 DISP=":99"
 VNC_PORT=5900
@@ -26,8 +27,15 @@ XDISPLAY_SIZE="1280x2100x24"
 # is root-owned anyway.
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="${ANDROID_HOME}"
-export DISPLAY="${DISP}"
 export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/emulator:${PATH}"
+
+# Pin the AVD + user homes so that `avdmanager` and `emulator` agree on where
+# AVDs live. Without this, avdmanager can register the AVD somewhere the
+# emulator never looks, giving "Unknown AVD name [...]".
+export ANDROID_USER_HOME="$HOME/.android"
+export ANDROID_AVD_HOME="$HOME/.android/avd"
+export DISPLAY="${DISP}"
+mkdir -p "${ANDROID_USER_HOME}" "${ANDROID_AVD_HOME}"
 
 log() { echo -e "\n=== $* ==="; }
 
@@ -69,10 +77,20 @@ fi
 # ---------------------------------------------------------------------------
 log "Creating AVD"
 echo "no" | avdmanager create avd \
-  -n cloudphone \
+  -n "${AVD_NAME}" \
   -k "${IMAGE}" \
   --device "${DEVICE}" \
-  --force >/dev/null
+  --force
+
+echo "AVD home: ${ANDROID_AVD_HOME}"
+ls -la "${ANDROID_AVD_HOME}" || true
+echo "AVDs seen by avdmanager:"; avdmanager list avd -c || true
+echo "AVDs seen by emulator:";   emulator -list-avds || true
+
+if ! emulator -list-avds | grep -qx "${AVD_NAME}"; then
+  echo "ERROR: AVD '${AVD_NAME}' was not registered. Aborting before we hang on adb."
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 log "Starting virtual display"
@@ -82,17 +100,24 @@ fluxbox >/dev/null 2>&1 &
 
 # ---------------------------------------------------------------------------
 log "Booting the Android emulator (this takes a few minutes)"
-emulator -avd cloudphone \
+emulator -avd "${AVD_NAME}" \
   -gpu swiftshader_indirect \
   -no-snapshot -no-audio -no-boot-anim \
   -camera-back none -camera-front none \
   -netdelay none -netspeed full &
 EMU_PID=$!
 
+sleep 5
+if ! kill -0 "${EMU_PID}" 2>/dev/null; then
+  echo "ERROR: the emulator process exited immediately after launch."
+  exit 1
+fi
+
 adb start-server >/dev/null 2>&1 || true
-adb wait-for-device
+# `adb wait-for-device` blocks forever if no emulator ever appears, so cap it.
+timeout 600 adb wait-for-device || { echo "No emulator device appeared within 10 minutes."; exit 1; }
 timeout 900 bash -c 'while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r\n")" != "1" ]; do sleep 5; done' \
-  || { echo "Emulator failed to boot in time"; exit 1; }
+  || { echo "Emulator failed to finish booting in time"; exit 1; }
 adb shell input keyevent 82 >/dev/null 2>&1 || true
 echo "Emulator booted."
 
