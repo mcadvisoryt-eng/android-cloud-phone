@@ -30,7 +30,7 @@ on:
           - "yes"
           - "no"
       arm_translation:
-        description: "Install ARM (libndk) translation so arm64-only APKs can run? Forces API 30."
+        description: "Use API 30 (which ships ARM/libndk translation) so arm64-only APKs can run?"
         required: true
         default: "no"
         type: choice
