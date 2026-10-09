@@ -21,23 +21,22 @@ know the password - keep it safe, or the backup is unrecoverable.
 
 ## Which image? (this is the important one)
 
-The default is now **`google_apis_playstore`** - Android with **Google Play
-Services and the Play Store**. This matters more than anything else for "do my
-apps work":
+The default is **`google_apis_playstore`** - Android with **Google Play Services
+and the Play Store**. This matters more than anything else for "do my apps work":
 
 - Apps that use Google sign-in, Maps, Firebase, push notifications, ads, or the
   Play Billing library **crash or hang on startup without Play Services**. The
-  `google_apis` image (Google APIs, no Play Store) lacks them, which is exactly
-  the "it launched then died" symptom.
-- Play Store images are also where you can install apps normally from the Play
-  Store, rather than sideloading APKs.
+  `google_apis` image lacks them.
+- **ARM-only apps need the API 30 image.** The Android 11 (API 30)
+  `google_apis_playstore` image ships Google's **libndk** native bridge and
+  advertises `arm64-v8a` / `armeabi-v7a`, so ARM-only APKs install and run. Newer
+  images such as API 33 do **not** include it, and ARM-only APKs fail there with
+  *"App not installed as app isn't compatible with your phone"*. Set
+  **arm_translation: yes** to force API 30 for this.
 
 **The trade-off:** Play Store images are production builds, so `adb root` is
-*refused*. On that image, root comes from **Magisk** only. If Magisk fails, the
+*refused*. On that image root comes from **Magisk** only. If Magisk fails, the
 phone still works but the encrypted backup can't read private app data.
-
-If you'd rather have guaranteed `adb root` (and reliable backups) over app
-compatibility, switch **target** back to `google_apis`.
 
 ---
 
@@ -45,12 +44,12 @@ compatibility, switch **target** back to `google_apis`.
 
 1. **Actions** tab -> **Cloud Phone** -> **Run workflow**.
 2. Set the inputs:
-   - **api_level** - default `33` (Android 13). Raise it if an app demands newer.
+   - **api_level** - `30` for ARM-only apps, otherwise `33`.
    - **duration_minutes** - default `300`; hard cap ~`340`.
    - **target** - `google_apis_playstore` (default, apps work), `google_apis`
-     (guaranteed `adb root`, no Play Services), or `default` (leanest, no Google).
-   - **magisk** - `yes`/`no`. On the Play Store image you want `yes`, since it's
-     the only root path there.
+     (guaranteed `adb root`, no Play Services), or `default`.
+   - **magisk** - `yes`/`no`.
+   - **arm_translation** - `yes` to force API 30 so arm64-only APKs run.
 3. Wait ~15-20 minutes.
 4. In the job log, find the banner:
    ```
@@ -58,10 +57,8 @@ compatibility, switch **target** back to `google_apis`.
    #   Open this in your browser:
    #     https://<random>.trycloudflare.com
    ```
-5. Open it, **click your device, and pick `proxy over adb`**. Mouse/tap = touch,
-   your keyboard types into Android.
-6. Sign into the Play Store, install what you need, use the phone, then **cancel
-   the run** when done.
+5. Open it, **click your device, and pick `proxy over adb`**. Mouse/tap = touch.
+6. Install/log in, use the phone, then **cancel the run** when done.
 
 ---
 
@@ -70,9 +67,9 @@ compatibility, switch **target** back to `google_apis`.
 - Every **15 minutes** (`BACKUP_INTERVAL_MIN`) the phone snapshots all
   **user-installed apps** - each APK plus its private data
   (`/data/user/0/<pkg>`, where browser cookies, saved logins and profiles live).
-- Encrypted with **AES-256-CBC** using `BACKUP_PASSWORD`, then force-pushed to a
-  branch called **`backups`** (one file, replaced each time).
-- A final snapshot runs when the session ends.
+- Encrypted with **AES-256-CBC** using `BACKUP_PASSWORD`.
+- Force-pushed to the **`backups`** branch, which keeps **only the newest**
+  snapshot (a fresh single-file commit replaces the branch each time).
 
 Decrypt with:
 
@@ -85,8 +82,6 @@ tar -xzf backup.tar.gz
 **Honest caveat:** restoring onto a *different* device is not always clean -
 Chrome sync tokens and some app data are bound to the device keychain. Treat this
 as a capture you can inspect and partially restore, not a guaranteed restore.
-Since the emulator is fresh each run, the useful backup is the one taken near the
-end of your session - the periodic snapshots cover that.
 
 ---
 
@@ -94,9 +89,8 @@ end of your session - the periodic snapshots cover that.
 
 - **`adb root`** - works on `google_apis`; refused on Play Store images.
 - **Magisk** via [rootAVD](https://github.com/newbit1/rootAVD), pinned to
-  **Magisk 25.2**. Magisk **26+** needs the "FAKEBOOTIMG" flow, which requires a
-  manual tap in the Magisk app and cannot run unattended; 25.2 (Android 13
-  capable) patches non-interactively.
+  **Magisk 25.2** (Magisk 26+ needs the manual "FAKEBOOTIMG" tap and cannot run
+  unattended).
 
 Magisk is **best-effort** - if it fails the run continues. Check the log line
 `root after Magisk step: adb=... su=...`.
@@ -123,8 +117,8 @@ In `scripts/cloud-phone.sh`:
   backup persists.
 - **No SIM.** No calls or SMS.
 - **2 vCPUs, no GPU** - software rendering is the ceiling on frame rate.
-- **x86_64 emulator:** apps that ship *only* ARM native libraries may still fail.
-  Most Play Store apps are fine, but a few heavy/game apps are ARM-only.
+- **ARM-only apps:** use **API 30** (set `arm_translation: yes`), which ships
+  libndk translation. API 33 and newer do not, so ARM-only apps fail there.
 - **GitHub Actions is a CI system.** Keep personal sessions short.
 - **The tunnel is public while it runs**, and the repo is public - the backup is
   protected *only* by your `BACKUP_PASSWORD`. Use a strong one.
