@@ -29,6 +29,14 @@ on:
         options:
           - "yes"
           - "no"
+      arm_translation:
+        description: "Install ARM (libndk) translation so arm64-only APKs can run? Forces API 30."
+        required: true
+        default: "no"
+        type: choice
+        options:
+          - "no"
+          - "yes"
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
@@ -59,6 +67,7 @@ jobs:
           ARCH: x86_64
           ENABLE_MAGISK: ${{ inputs.magisk == 'yes' && '1' || '0' }}
           MAGISK_VER: "25.2"
+          ARM_TRANSLATION: ${{ inputs.arm_translation == 'yes' && '1' || '0' }}
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
