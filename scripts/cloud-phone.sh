@@ -2,7 +2,7 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root, optionally enable ARM translation, and periodically back up user apps.
+# root, and periodically back up user apps (encrypted).
 #
 # Everything runs in ONE process tree: GitHub Actions kills background processes
 # when a step ends, so the emulator/server/tunnel live here and the script sleeps.
@@ -15,18 +15,18 @@ TARGET="${TARGET:-google_apis_playstore}"
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
-MAX_SIZE="${MAX_SIZE:-640}"           # scrcpy downscale (lower = smoother)
+MAX_SIZE="${MAX_SIZE:-640}"
 WS_PORT="${WS_PORT:-8000}"
 ENABLE_MAGISK="${ENABLE_MAGISK:-1}"
-MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
+MAGISK_VER="${MAGISK_VER:-25.2}"
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
 ARM_TRANSLATION="${ARM_TRANSLATION:-0}"
 
-# The libndk ARM-translation Magisk module is built for Android 11 (API 30), so
-# when ARM translation is requested we pin the API level to match.
+# ARM-only apps need the API 30 image, which is the one that ships Google's
+# libndk native bridge. So requesting ARM translation pins the API level.
 if [ "${ARM_TRANSLATION}" = "1" ] && [ "${API_LEVEL}" != "30" ]; then
-  echo "NOTE: ARM translation targets Android 11 - overriding API level ${API_LEVEL} -> 30"
+  echo "NOTE: ARM translation needs the API 30 image - overriding API level ${API_LEVEL} -> 30"
   API_LEVEL=30
 fi
 
@@ -41,7 +41,7 @@ log() { echo -e "\n=== $* ==="; }
 
 start_emulator() {
   emulator -avd "${AVD_NAME}" \
-    -no-window -no-audio -no-boot-anim -no-snapshot \
+    -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
     -gpu swiftshader_indirect \
     -camera-back none -camera-front none \
     -netdelay none -netspeed full &
@@ -143,16 +143,23 @@ if [ "${ENABLE_MAGISK}" = "1" ]; then
   RAMDISK_REL="system-images/android-${API_LEVEL}/${TARGET}/${ARCH}/ramdisk.img"
   ( cd "$HOME/rootAVD" && chmod +x rootAVD.sh && ./rootAVD.sh "${RAMDISK_REL}" ) 2>&1 | tail -80
   set -e
-  # rootAVD shuts the AVD down; bring it back on the patched ramdisk.
-  adb kill-server >/dev/null 2>&1 || true
+  # rootAVD shuts the AVD down. Wait for the old emulator to fully exit first,
+  # or the new one refuses to start ("multiple emulators with the same AVD").
+  adb emu kill >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    kill -0 "${EMU_PID}" 2>/dev/null || break
+    sleep 2
+  done
+  pkill -f "qemu-system" >/dev/null 2>&1 || true
   sleep 3
+  adb kill-server >/dev/null 2>&1 || true
+  sleep 2
   start_emulator
   sleep 5
   if wait_boot; then
     adb root >/dev/null 2>&1 || true
     sleep 3
     if is_root; then ROOT_OK=1; fi
-    # Magisk's su may pop an approval dialog; nudge it a few times.
     for _ in 1 2 3 4 5; do
       if try_su; then SU_OK=1; break; fi
       adb shell input keyevent 61 >/dev/null 2>&1 || true
@@ -167,46 +174,20 @@ if [ "${ENABLE_MAGISK}" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# ARM translation: let arm64-v8a / armeabi-v7a-only APKs install on the x86_64
-# emulator, via Google's libndk native bridge, installed as a Magisk module.
-# Best-effort and version-sensitive.
+# ARM translation. Finding from a real run: the API 30 (Android 11)
+# google_apis_playstore image ALREADY ships Google's libndk native bridge and
+# advertises arm64-v8a / armeabi-v7a, so ARM-only APKs install with no extra
+# work. (Newer images, e.g. API 33, do not.) Enabling this therefore just means
+# "use API 30" - no Magisk module is required.
 if [ "${ARM_TRANSLATION}" = "1" ]; then
-  log "ARM translation: installing the libndk native bridge (best effort)"
-  set +e
-  as_root() { if [ "${ROOT_OK}" = "1" ]; then adb shell "$1"; else adb shell "su -c '$1'"; fi; }
-
-  if [ "${ROOT_OK}" != "1" ] && [ "${SU_OK}" != "1" ]; then
-    echo "No root available - cannot install the ARM translation module. Skipping."
+  log "ARM translation: using the image's built-in libndk native bridge"
+  echo "  native bridge : $(adb shell getprop ro.dalvik.vm.native.bridge 2>/dev/null | tr -d '\r')"
+  echo "  abilist       : $(adb shell getprop ro.product.cpu.abilist 2>/dev/null | tr -d '\r')"
+  if adb shell getprop ro.product.cpu.abilist 2>/dev/null | grep -q 'arm64-v8a'; then
+    echo "  -> ARM ABIs advertised: arm64-only APKs should install and run."
   else
-    sudo apt-get install -y -qq zip >/dev/null 2>&1 || true
-    rm -rf /tmp/armmod && mkdir -p /tmp/armmod
-    curl -sSL -o /tmp/armmod/mod.zip \
-      "https://codeload.github.com/ALEX5402/libndk_translation_Module/zip/refs/heads/master"
-    ( cd /tmp/armmod && unzip -q mod.zip )
-    MODDIR="$(ls -d /tmp/armmod/libndk_translation_Module-* 2>/dev/null | head -1)"
-    if [ -n "${MODDIR}" ]; then
-      # The module's installer hard-gates on Android 10; neutralise that gate.
-      sed -i 's/abort "Only support Android Virtual Devices.*/:/' "${MODDIR}/customize.sh"
-      sed -i 's/abort "Only support Android 10".*/:/' "${MODDIR}/customize.sh"
-      ( cd "${MODDIR}" && zip -qr /tmp/armmod/armtrans.zip . -x 'image.png' )
-      adb push /tmp/armmod/armtrans.zip /data/local/tmp/armtrans.zip >/dev/null 2>&1
-      as_root "magisk --install-module /data/local/tmp/armtrans.zip"
-      echo "Module installed; rebooting to apply."
-      adb reboot >/dev/null 2>&1 || true
-      sleep 15
-      if wait_boot; then
-        adb root >/dev/null 2>&1 || true
-        sleep 3
-        echo "ABIs after ARM translation:"
-        adb shell getprop ro.product.cpu.abilist | tr -d '\r'
-      else
-        echo "Reboot after ARM translation failed; continuing."
-      fi
-    else
-      echo "Could not unpack the ARM translation module."
-    fi
+    echo "  -> No ARM ABI advertised; ARM-only APKs will NOT install on this image."
   fi
-  set -e
 fi
 
 # ---------------------------------------------------------------------------
@@ -230,7 +211,6 @@ do_backup() {
       [ -n "${apk}" ] && adb pull "${apk}" "${WORK}/apps/${pkg}/" >/dev/null 2>&1 || true
     done
 
-    # Private app data (needs root)
     if [ "${ROOT_OK}" = "1" ]; then
       adb exec-out "tar -czf - -C /data/user/0 ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
     elif [ "${SU_OK}" = "1" ]; then
