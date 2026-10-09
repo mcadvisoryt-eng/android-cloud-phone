@@ -7,7 +7,7 @@ on:
       api_level:
         description: "Android API level (e.g. 30, 33, 34)"
         required: true
-        default: "30"
+        default: "33"
       duration_minutes:
         description: "How long to keep the phone alive (minutes, max ~340)"
         required: true
@@ -21,6 +21,18 @@ on:
           - google_apis
           - google_apis_playstore
           - default
+      magisk:
+        description: "Try to install Magisk (root)?"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
+
+# Needed so the script can push the encrypted backup to the 'backups' branch.
+permissions:
+  contents: write
 
 jobs:
   cloud-phone:
@@ -45,4 +57,9 @@ jobs:
           DURATION_MIN: ${{ inputs.duration_minutes }}
           TARGET: ${{ inputs.target }}
           ARCH: x86_64
+          ENABLE_MAGISK: ${{ inputs.magisk == 'yes' && '1' || '0' }}
+          MAGISK_VER: "25.2"
+          # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
+          BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
+          BACKUP_INTERVAL_MIN: "15"
         run: bash scripts/cloud-phone.sh
