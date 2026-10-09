@@ -15,11 +15,11 @@ on:
       target:
         description: "System image target"
         required: true
-        default: "google_apis"
+        default: "google_apis_playstore"
         type: choice
         options:
-          - google_apis
           - google_apis_playstore
+          - google_apis
           - default
       magisk:
         description: "Try to install Magisk (root)?"
