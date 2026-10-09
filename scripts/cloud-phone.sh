@@ -1,39 +1,64 @@
 #!/usr/bin/env bash
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
-# GitHub Actions runner and stream it to the browser with scrcpy (H.264)
-# through ws-scrcpy, exposed over a public Cloudflare tunnel.
+# GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
+# root, and periodically back up user apps + their data (encrypted).
 #
-# Why not noVNC: VNC/RFB sends screen-update rectangles, not video. It is slow
-# and choppy for a live phone. scrcpy captures the Android framebuffer directly
-# and encodes H.264, which is what actually gives smooth 30-60fps.
-#
-# The emulator runs HEADLESS (-no-window): scrcpy captures the device itself, so
-# there is no X server, no VNC, and no double rendering.
-#
-# Everything lives in ONE process tree: GitHub Actions kills background
-# processes when a step ends, so this script starts everything and then sleeps.
+# Key design notes:
+#  * Everything runs in ONE process tree. GitHub Actions kills background
+#    processes when a step ends, so the emulator/server/tunnel all live here and
+#    the script sleeps at the end.
+#  * The emulator runs HEADLESS; scrcpy captures the framebuffer directly.
+#  * Root: `adb root` where the image allows it (google_apis), plus a best-effort
+#    Magisk install via rootAVD (pinned to a Magisk < 26, which can be patched
+#    non-interactively - Magisk >= 26 needs the manual "FAKEBOOTIMG" tap).
+#  * Backup: user apps' APKs + /data/user/0/<pkg> data, tarred and AES-encrypted
+#    with $BACKUP_PASSWORD, then force-pushed to a "backups" branch.
 #
 set -euo pipefail
 
-API_LEVEL="${API_LEVEL:-30}"
+API_LEVEL="${API_LEVEL:-33}"
 ARCH="${ARCH:-x86_64}"
 TARGET="${TARGET:-google_apis}"
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
-MAX_SIZE="${MAX_SIZE:-720}"     # scrcpy: downscale longest edge to this
-WS_PORT="${WS_PORT:-8000}"      # ws-scrcpy web UI
+MAX_SIZE="${MAX_SIZE:-640}"           # scrcpy downscale (lower = smoother)
+WS_PORT="${WS_PORT:-8000}"
+ENABLE_MAGISK="${ENABLE_MAGISK:-1}"
+MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
+BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
+BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
 
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="${ANDROID_HOME}"
 export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/emulator:${PATH}"
-# Pin AVD + user homes so avdmanager and emulator agree on where AVDs live.
 export ANDROID_USER_HOME="$HOME/.android"
 export ANDROID_AVD_HOME="$HOME/.android/avd"
 mkdir -p "${ANDROID_USER_HOME}" "${ANDROID_AVD_HOME}"
 
 log() { echo -e "\n=== $* ==="; }
+
+start_emulator() {
+  emulator -avd "${AVD_NAME}" \
+    -no-window -no-audio -no-boot-anim -no-snapshot \
+    -gpu swiftshader_indirect \
+    -camera-back none -camera-front none \
+    -netdelay none -netspeed full &
+  EMU_PID=$!
+}
+
+wait_boot() {
+  adb start-server >/dev/null 2>&1 || true
+  timeout 600 adb wait-for-device || { echo "No emulator device appeared within 10 minutes."; return 1; }
+  timeout 900 bash -c 'while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r\n")" != "1" ]; do sleep 5; done' \
+    || { echo "Emulator failed to finish booting in time"; return 1; }
+  return 0
+}
+
+is_root() {
+  [ "$(adb shell id -u 2>/dev/null | tr -d '\r')" = "0" ]
+}
 
 # ---------------------------------------------------------------------------
 log "Freeing disk space"
@@ -67,8 +92,6 @@ log "Creating AVD"
 echo "no" | avdmanager create avd \
   -n "${AVD_NAME}" -k "${IMAGE}" --device "${DEVICE}" --force
 
-# Shrink the phone's own framebuffer. Software rendering cost scales with pixel
-# count, so 720x1280 is dramatically lighter than 1080x1920 on 2 vCPUs.
 AVD_INI="${ANDROID_AVD_HOME}/${AVD_NAME}.avd/config.ini"
 if [ -f "${AVD_INI}" ]; then
   sed -i '/^hw\.lcd\.width=/d; /^hw\.lcd\.height=/d; /^hw\.lcd\.density=/d' "${AVD_INI}"
@@ -83,45 +106,125 @@ fi
 
 # ---------------------------------------------------------------------------
 log "Booting the Android emulator (headless)"
-emulator -avd "${AVD_NAME}" \
-  -no-window -no-audio -no-boot-anim -no-snapshot \
-  -gpu swiftshader_indirect \
-  -camera-back none -camera-front none \
-  -netdelay none -netspeed full &
-EMU_PID=$!
-
+start_emulator
 sleep 5
 if ! kill -0 "${EMU_PID}" 2>/dev/null; then
   echo "ERROR: the emulator process exited immediately after launch."
   exit 1
 fi
-
-adb start-server >/dev/null 2>&1 || true
-timeout 600 adb wait-for-device || { echo "No emulator device appeared within 10 minutes."; exit 1; }
-timeout 900 bash -c 'while [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r\n")" != "1" ]; do sleep 5; done' \
-  || { echo "Emulator failed to finish booting in time"; exit 1; }
+wait_boot || exit 1
 echo "Emulator booted."
+
+# ---------------------------------------------------------------------------
+log "Root: trying 'adb root' (works on google_apis images)"
+adb root >/dev/null 2>&1 || true
+sleep 3
+ROOT_OK=0
+if is_root; then ROOT_OK=1; fi
+echo "root via adb: ${ROOT_OK}"
+
+if [ "${ENABLE_MAGISK}" = "1" ]; then
+  log "Root: installing Magisk via rootAVD (best effort, Magisk ${MAGISK_VER})"
+  set +e
+  if [ ! -d "$HOME/rootAVD" ]; then
+    git clone --depth 1 https://github.com/newbit1/rootAVD.git "$HOME/rootAVD"
+  fi
+  curl -sSL -o "$HOME/rootAVD/Magisk.zip" \
+    "https://github.com/topjohnwu/Magisk/releases/download/v${MAGISK_VER}/Magisk-v${MAGISK_VER}.apk"
+  RAMDISK_REL="system-images/android-${API_LEVEL}/${TARGET}/${ARCH}/ramdisk.img"
+  ( cd "$HOME/rootAVD" && chmod +x rootAVD.sh && ./rootAVD.sh "${RAMDISK_REL}" ) 2>&1 | tail -80
+  set -e
+  # rootAVD shuts the AVD down; bring it back on the patched ramdisk.
+  adb kill-server >/dev/null 2>&1 || true
+  sleep 3
+  start_emulator
+  sleep 5
+  if wait_boot; then
+    adb root >/dev/null 2>&1 || true
+    sleep 3
+    if is_root; then ROOT_OK=1; fi
+  else
+    echo "Reboot after Magisk failed; continuing with what we have."
+  fi
+  echo "root after Magisk step: ${ROOT_OK}"
+fi
+
+# ---------------------------------------------------------------------------
+do_backup() {
+  [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
+  local WORK OUT BUNDLE STAMP
+  WORK="$(mktemp -d)"
+  STAMP="$(date -u +%Y%m%d-%H%M%S)"
+  echo "Backing up user apps (root=${ROOT_OK}) at ${STAMP}"
+
+  adb shell pm list packages -3 2>/dev/null | sed 's/^package://' | tr -d '\r' > "${WORK}/applist.txt" || true
+  echo "User-installed apps: $(wc -l < "${WORK}/applist.txt")"
+
+  while read -r pkg; do
+    [ -n "${pkg}" ] || continue
+    echo "  - ${pkg}"
+    mkdir -p "${WORK}/apps/${pkg}"
+    adb shell am force-stop "${pkg}" >/dev/null 2>&1 || true
+
+    # APK(s)
+    adb shell pm path "${pkg}" 2>/dev/null | sed 's/^package://' | tr -d '\r' | while read -r apk; do
+      [ -n "${apk}" ] && adb pull "${apk}" "${WORK}/apps/${pkg}/" >/dev/null 2>&1 || true
+    done
+
+    # Private app data (needs root)
+    if [ "${ROOT_OK}" = "1" ]; then
+      adb exec-out "tar -czf - -C /data/user/0 ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
+    else
+      adb exec-out "su -c 'tar -czf - -C /data/user/0 ${pkg}'" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
+    fi
+
+    # External data (browsers sometimes keep bits here)
+    adb exec-out "tar -czf - -C /sdcard/Android/data ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/external.tar.gz" 2>/dev/null || true
+  done < "${WORK}/applist.txt"
+
+  { echo "cloud-phone backup"; echo "timestamp: ${STAMP}"; echo "root: ${ROOT_OK}";
+    echo "api-level: ${API_LEVEL}"; echo "target: ${TARGET}"; } > "${WORK}/MANIFEST.txt"
+  adb shell pm list packages 2>/dev/null | tr -d '\r' > "${WORK}/packages-all.txt" || true
+
+  BUNDLE="/tmp/cloudphone-bundle.tar.gz"
+  tar -czf "${BUNDLE}" -C "${WORK}" .
+  OUT="/tmp/cloudphone-backup-${STAMP}.tar.gz.enc"
+  openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+    -pass env:BACKUP_PASSWORD -in "${BUNDLE}" -out "${OUT}"
+  rm -rf "${WORK}" "${BUNDLE}"
+  echo "Encrypted backup: $(du -h "${OUT}" | cut -f1)"
+
+  # Publish: force-push a single branch so the repo does not grow unbounded.
+  (
+    cd "${GITHUB_WORKSPACE:-$PWD}"
+    mkdir -p backups
+    cp "${OUT}" "backups/$(basename "${OUT}")"
+    git config user.email "cloud-phone-bot@users.noreply.github.com"
+    git config user.name "cloud-phone-bot"
+    git checkout -B backups >/dev/null 2>&1 || true
+    git add -f backups
+    git commit -m "Encrypted cloud phone backup ${STAMP}" >/dev/null 2>&1 || true
+    git push -f origin backups >/dev/null 2>&1 && echo "Backup pushed to branch 'backups'." \
+      || echo "Backup push failed (needs 'contents: write' permission)."
+  )
+  rm -f "${OUT}"
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 log "Building ws-scrcpy (H.264 streaming server)"
 rm -rf "$HOME/ws-scrcpy"
 git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git "$HOME/ws-scrcpy"
 cd "$HOME/ws-scrcpy"
-
-# Build flags: drop the ADB-shell feature (needs node-pty native build) and make
-# the on-device server reachable over adb, which is what an emulator needs.
 cat > build.config.override.json <<'JSON'
 {
   "INCLUDE_ADB_SHELL": false,
   "SCRCPY_LISTENS_ON_ALL_INTERFACES": false
 }
 JSON
-
-# --ignore-scripts skips native builds we don't need; --omit=optional skips Appium.
 npm install --ignore-scripts --omit=optional --no-audit --no-fund
 npm run dist
 
-# ---------------------------------------------------------------------------
 log "Starting ws-scrcpy server on port ${WS_PORT}"
 node dist/index.js > /tmp/ws-scrcpy.log 2>&1 &
 WSS_PID=$!
@@ -163,7 +266,8 @@ echo "#   Open this in your browser:                                #"
 echo "#     ${URL}"
 echo "#                                                             #"
 echo "#   Then: click your device, and pick 'proxy over adb'.       #"
-echo "#   Mouse/tap = touch. H.264 stream = smooth.                 #"
+echo "#   Root: adb root=${ROOT_OK}  (Magisk best-effort)             #"
+echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> branch 'backups'" || echo "off (no BACKUP_PASSWORD)")#"
 echo "#   Stays up for ${DURATION_MIN} minutes.                         #"
 echo "#                                                             #"
 echo "###############################################################"
@@ -171,13 +275,24 @@ echo ""
 
 # ---------------------------------------------------------------------------
 log "Keeping the phone alive for ${DURATION_MIN} minutes"
-END=$(( $(date +%s) + DURATION_MIN * 60 ))
+NOW="$(date +%s)"
+END=$(( NOW + DURATION_MIN * 60 ))
+NEXT_BACKUP=$(( NOW + 60 ))   # first backup ~1 min in, then every interval
 while [ "$(date +%s)" -lt "${END}" ]; do
   if ! kill -0 "${EMU_PID}" 2>/dev/null; then
     echo "Emulator process exited - stopping."
     break
   fi
+  if [ -n "${BACKUP_PASSWORD}" ] && [ "$(date +%s)" -ge "${NEXT_BACKUP}" ]; then
+    do_backup || echo "Backup attempt failed; will retry next interval."
+    NEXT_BACKUP=$(( $(date +%s) + BACKUP_INTERVAL_MIN * 60 ))
+  fi
   sleep 30
 done
+
+if [ -n "${BACKUP_PASSWORD}" ]; then
+  log "Final backup"
+  do_backup || echo "Final backup failed."
+fi
 
 echo "Session finished."
