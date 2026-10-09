@@ -21,9 +21,12 @@ VNC_PORT=5900
 NOVNC_PORT=6080
 XDISPLAY_SIZE="1280x2100x24"
 
-export DISPLAY="${DISP}"
-export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+# Use our OWN SDK directory. Do NOT inherit the runner's $ANDROID_HOME: it points
+# at /usr/local/lib/android/sdk, which we delete below to free space, and which
+# is root-owned anyway.
+export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="${ANDROID_HOME}"
+export DISPLAY="${DISP}"
 export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${ANDROID_HOME}/emulator:${PATH}"
 
 log() { echo -e "\n=== $* ==="; }
@@ -53,17 +56,21 @@ if [ ! -x "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" ]; then
 fi
 
 yes | sdkmanager --licenses >/dev/null 2>&1 || true
-sdkmanager --install \
-  "platform-tools" \
-  "emulator" \
-  "platforms;android-${API_LEVEL}" \
-  "system-images;android-${API_LEVEL};${TARGET};${ARCH}" >/dev/null
+sdkmanager --install "platform-tools" "emulator" "platforms;android-${API_LEVEL}" >/dev/null
+
+IMAGE="system-images;android-${API_LEVEL};${TARGET};${ARCH}"
+if ! sdkmanager --install "${IMAGE}" >/dev/null 2>&1; then
+  echo "System image '${IMAGE}' is not available - falling back to google_apis."
+  TARGET="google_apis"
+  IMAGE="system-images;android-${API_LEVEL};${TARGET};${ARCH}"
+  sdkmanager --install "${IMAGE}" >/dev/null
+fi
 
 # ---------------------------------------------------------------------------
 log "Creating AVD"
 echo "no" | avdmanager create avd \
   -n cloudphone \
-  -k "system-images;android-${API_LEVEL};${TARGET};${ARCH}" \
+  -k "${IMAGE}" \
   --device "${DEVICE}" \
   --force >/dev/null
 
