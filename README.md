@@ -1,70 +1,109 @@
 # Cloud Phone
 
-Spin up a **visual, touch-enabled Android phone** on a free GitHub Actions
-runner, control it from any browser, and throw it away when you're done.
+Spin up a **visual, touch-enabled, rooted Android phone** on a free GitHub
+Actions runner, control it from any browser, and have it **automatically back up
+your apps and their data** - encrypted - to this repo. Throw it away when done.
 
-No server, no account, no local install. Press a button, wait a few minutes, and
-get a URL that opens a live Android screen you can tap, swipe and type on.
-
-Streaming is done with **scrcpy (H.264)** via [ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy)
-- not VNC. VNC sends screen-update rectangles and is choppy for a live phone;
-H.264 video is what gives smooth 30-60fps.
+Streaming uses **scrcpy (H.264)** via [ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy),
+not VNC. H.264 video is what gives smooth playback; VNC's screen-update protocol
+is choppy for a live phone.
 
 ---
 
-## What you get
+## Before you start
 
-- A real Android emulator (choose the API level when you start it).
-- A **visible screen** you can interact with - mouse/tap = touch, your keyboard
-  types into Android.
-- **Working internet** inside Android, so you can browse and download things.
-- A **disposable** phone: when the job ends, everything is gone.
+**Add a repo secret called `BACKUP_PASSWORD`.** Settings -> Secrets and variables
+-> Actions -> New repository secret. The backup is AES-256 encrypted with this
+password; without it, backups are skipped (everything else still works). Only you
+know the password - keep it safe, or the backup is unrecoverable.
 
 ---
 
 ## How to use it
 
-1. Open the **Actions** tab of this repository.
-2. Pick **Cloud Phone** in the left sidebar.
-3. Click **Run workflow**, set your options, and confirm:
-   - **api_level** - e.g. `30`, `33`, `34`.
-   - **duration_minutes** - how long to keep it alive (default `300`, max ~`340`).
-   - **target** - `google_apis` (recommended), `google_apis_playstore`
-     (adds the Play Store), or `default` (leanest).
-4. Wait for the job to reach the **Launch cloud phone** step. It takes a few
-   minutes to install the SDK, build the streaming server, and boot Android.
-5. In the job log, look for the banner with your link:
-
+1. **Actions** tab -> **Cloud Phone** -> **Run workflow**.
+2. Set the inputs:
+   - **api_level** - default `33` (Android 13).
+   - **duration_minutes** - how long to keep it alive (default `300`; hard cap ~`340`).
+   - **target** - `google_apis` (recommended: Google APIs *and* working `adb root`),
+     `google_apis_playstore` (adds the Play Store, but `adb root` is refused there,
+     so root then depends entirely on Magisk succeeding), or `default`.
+   - **magisk** - `yes`/`no`. `no` skips the (best-effort) Magisk install.
+3. Wait ~15 minutes: SDK install, Android boot, Magisk patch, streaming build.
+4. In the job log, find the banner with your link:
    ```
-   ###############################################################
-   #   YOUR CLOUD PHONE IS LIVE  (scrcpy / H.264)                #
-   #   Open this in your browser:                                #
-   #     https://something-random.trycloudflare.com              #
-   ###############################################################
+   #   YOUR CLOUD PHONE IS LIVE  (scrcpy / H.264)
+   #   Open this in your browser:
+   #     https://<random>.trycloudflare.com
    ```
-
-6. Open that link, then **click your device in the list and choose
-   `proxy over adb`** from the connection options. (The emulator's on-device
-   server is only reachable over adb, so that's the option that works.)
-7. When you're finished, **cancel the workflow run** (Actions -> the run ->
-   Cancel) so the phone shuts down immediately instead of waiting out the timer.
+5. Open it, **click your device, and pick `proxy over adb`**. Mouse/tap = touch,
+   your keyboard types into Android.
+6. Install/log into Chrome or Firefox, use the phone, then **cancel the run**
+   when you're done.
 
 ---
 
-## Options you can tweak
+## Backups
 
-| Input | Default | Notes |
-|---|---|---|
-| `api_level` | `30` | Android version. 30 is a good balance of speed and app support. |
-| `duration_minutes` | `300` | Keep-alive time. GitHub caps a job at 6 hours. |
-| `target` | `google_apis` | `google_apis_playstore` gives you Play Services + Play Store. |
+- Every **15 minutes** (`BACKUP_INTERVAL_MIN`) the phone snapshots all
+  **user-installed apps** - each app's APK plus its private data
+  (`/data/user/0/<pkg>`, which is where browser cookies, saved logins and
+  profiles live) and any external data.
+- The bundle is tarred and **encrypted with AES-256-CBC** using `BACKUP_PASSWORD`.
+- It is force-pushed to a branch called **`backups`** (one file, replaced each
+  time, so the repo does not grow unbounded).
+- A final backup runs when the session ends.
 
-In `scripts/cloud-phone.sh` you can also change:
+**To decrypt** (on any machine with OpenSSL):
 
-- `MAX_SIZE` (default `720`) - scrcpy downscales the longest screen edge to
-  this. Lower = smoother. This is the single biggest lever on frame rate.
-- The `hw.lcd.*` values written into the AVD config - the phone's own framebuffer
-  resolution. Lower = less work for the (software) renderer.
+```bash
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+  -in cloudphone-backup-YYYYmmdd-HHMMSS.tar.gz.enc \
+  -out backup.tar.gz
+tar -xzf backup.tar.gz
+```
+
+You'll get `apps/<package>/` with the APKs and `data.tar.gz` per app.
+
+**Caveats, honestly:** restoring this onto a *different* device is not always
+clean - some apps (Chrome sync tokens, banking apps, Signal) bind their data to
+the device keychain and will complain. This is a *capture* you can inspect and
+partially restore, not a guaranteed full restore. Also, because the emulator is
+fresh each run, the useful backup is the one taken near the end of your session -
+the periodic snapshots cover that.
+
+---
+
+## Root
+
+Two layers, deliberately:
+
+1. **`adb root`** - on `google_apis` images this just works and gives a root
+   shell. It's what makes the backup reliable.
+2. **Magisk** - installed via [rootAVD](https://github.com/newbit1/rootAVD),
+   pinned to **Magisk 25.2**. That version is deliberate: Magisk **26+** requires
+   the "FAKEBOOTIMG" flow, which needs a manual tap inside the Magisk app and
+   therefore cannot run unattended. 25.2 (which supports Android 13) can be
+   patched non-interactively.
+
+The Magisk step is **best-effort**: if it fails, the run continues and the backup
+still works via `adb root`. Check the log line `root after Magisk step:`.
+
+**KernelSU is not an option here.** It's kernel-based and needs a custom kernel
+compiled with KernelSU; no such kernel is published for the Android emulator.
+Magisk is the practical choice.
+
+---
+
+## Tuning
+
+In `scripts/cloud-phone.sh`:
+
+- `MAX_SIZE` (default `640`) - scrcpy downscales the longest edge to this.
+  **The biggest lever on frame rate/latency.** Try `540` or `480`.
+- `hw.lcd.*` in the AVD config - the phone's own framebuffer (720x1280).
+- `BACKUP_INTERVAL_MIN` (default `15`) - how often to snapshot.
+- `MAGISK_VER` - pin a different Magisk (must be `< 26` to stay unattended).
 
 ---
 
@@ -72,47 +111,29 @@ In `scripts/cloud-phone.sh` you can also change:
 
 ```
 browser --https/wss--> trycloudflare.com --> runner:8000 (ws-scrcpy)
-                                                  |
-                                          adb --> Android emulator
-                                                  (headless, KVM accelerated)
-                                                  |
-                                          scrcpy-server captures + encodes H.264
+                                                 |
+                                        adb --> Android emulator (headless, KVM)
+                                                 |
+                                        scrcpy-server encodes H.264
+                                                 |
+                              adb root / Magisk su --> tar app data
+                                                 |
+                              openssl AES-256 --> git push origin backups
 ```
 
-Everything (emulator, ws-scrcpy server, tunnel) runs inside a single script so
-it stays alive for the whole job. GitHub Actions kills background processes when
-a step ends, which is why the script sleeps at the end rather than returning.
-
-The emulator runs **headless** (`-no-window`); scrcpy captures the device
-framebuffer directly. There is no X server and no VNC in the path.
+Everything runs inside one script because GitHub Actions kills background
+processes when a step ends; the script sleeps at the end to hold the job open.
 
 ---
 
-## Why it can still be slow
+## Limits
 
-A free GitHub runner has **2 vCPUs and no GPU**, so Android runs with software
-rendering. That is the hard ceiling on frame rate - no streaming change can fix
-it. What the H.264 path fixes is the *second* bottleneck (VNC's inefficient
-protocol). To go further, lower `MAX_SIZE`, lower the framebuffer resolution, or
-use a larger (paid) runner with more vCPUs.
-
----
-
-## Heads-up / limits
-
-- **It's temporary.** The phone vanishes when the run ends. Nothing is saved.
-- **No SIM.** No calls or SMS; apps that demand a phone number will complain.
-- **GitHub Actions is a CI system.** Using runners as personal compute for long
-  stretches sits outside what it's designed for. Keep sessions short. For
-  something permanent, run [redroid](https://github.com/remote-android/redroid-doc)
-  or [docker-android](https://github.com/budtmo/docker-android) on your own box.
-- **The tunnel is public while it runs.** Anyone with the link can see the
-  screen. Don't log into anything sensitive, and cancel the run when done.
-
----
-
-## Credits
-
-Google's Android emulator, [Genymobile/scrcpy](https://github.com/Genymobile/scrcpy),
-[NetrisTV/ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy), Cloudflare quick
-tunnels, and the KVM enablement documented by GitHub.
+- **It's temporary.** The phone vanishes when the run ends; only the encrypted
+  backup persists.
+- **No SIM.** No calls or SMS.
+- **2 vCPUs, no GPU** - Android runs on software rendering. That's the ceiling on
+  frame rate; H.264 fixed the protocol half, not the renderer half.
+- **GitHub Actions is a CI system.** Long personal sessions sit outside what it's
+  designed for. Keep them short.
+- **The tunnel is public while it runs**, and the repo is public - the backup is
+  protected *only* by your `BACKUP_PASSWORD`. Use a strong one.
