@@ -19,7 +19,7 @@ set -euo pipefail
 
 API_LEVEL="${API_LEVEL:-33}"
 ARCH="${ARCH:-x86_64}"
-TARGET="${TARGET:-google_apis}"
+TARGET="${TARGET:-google_apis_playstore}"
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
@@ -115,13 +115,22 @@ fi
 wait_boot || exit 1
 echo "Emulator booted."
 
+log "Device ABI support (decides whether ARM-only APKs can install)"
+for p in ro.product.cpu.abilist ro.product.cpu.abilist64 ro.product.cpu.abilist32 \
+         ro.enable.native.bridge.exec ro.dalvik.vm.native.bridge; do
+  echo "  ${p} = $(adb shell getprop ${p} 2>/dev/null | tr -d '\r')"
+done
+
 # ---------------------------------------------------------------------------
-log "Root: trying 'adb root' (works on google_apis images)"
+log "Root: 'adb root' (works on google_apis, refused on playstore images)"
 adb root >/dev/null 2>&1 || true
 sleep 3
 ROOT_OK=0
 if is_root; then ROOT_OK=1; fi
-echo "root via adb: ${ROOT_OK}"
+SU_OK=0
+echo "adb root: ${ROOT_OK}"
+
+try_su() { adb shell su -c id 2>/dev/null | grep -q 'uid=0'; }
 
 if [ "${ENABLE_MAGISK}" = "1" ]; then
   log "Root: installing Magisk via rootAVD (best effort, Magisk ${MAGISK_VER})"
@@ -143,10 +152,18 @@ if [ "${ENABLE_MAGISK}" = "1" ]; then
     adb root >/dev/null 2>&1 || true
     sleep 3
     if is_root; then ROOT_OK=1; fi
+    # Magisk's su may pop an approval dialog; nudge it a few times.
+    for _ in 1 2 3 4 5; do
+      if try_su; then SU_OK=1; break; fi
+      adb shell input keyevent 61 >/dev/null 2>&1 || true
+      adb shell input keyevent 61 >/dev/null 2>&1 || true
+      adb shell input keyevent 66 >/dev/null 2>&1 || true
+      sleep 3
+    done
   else
     echo "Reboot after Magisk failed; continuing with what we have."
   fi
-  echo "root after Magisk step: ${ROOT_OK}"
+  echo "root after Magisk step: adb=${ROOT_OK} su=${SU_OK}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -174,8 +191,11 @@ do_backup() {
     # Private app data (needs root)
     if [ "${ROOT_OK}" = "1" ]; then
       adb exec-out "tar -czf - -C /data/user/0 ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
-    else
+    elif [ "${SU_OK}" = "1" ]; then
       adb exec-out "su -c 'tar -czf - -C /data/user/0 ${pkg}'" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
+    else
+      echo "     (no root available - private data not captured)"
+      : > "${WORK}/apps/${pkg}/data.tar.gz"
     fi
 
     # External data (browsers sometimes keep bits here)
@@ -266,7 +286,7 @@ echo "#   Open this in your browser:                                #"
 echo "#     ${URL}"
 echo "#                                                             #"
 echo "#   Then: click your device, and pick 'proxy over adb'.       #"
-echo "#   Root: adb root=${ROOT_OK}  (Magisk best-effort)             #"
+echo "#   Root: adb=${ROOT_OK} su=${SU_OK}                            #"
 echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> branch 'backups'" || echo "off (no BACKUP_PASSWORD)")#"
 echo "#   Stays up for ${DURATION_MIN} minutes.                         #"
 echo "#                                                             #"
