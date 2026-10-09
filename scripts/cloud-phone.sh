@@ -20,7 +20,9 @@ AVD_NAME="cloudphone"
 DISP=":99"
 VNC_PORT=5900
 NOVNC_PORT=6080
-XDISPLAY_SIZE="1280x2100x24"
+XDISPLAY_SIZE="1000x1600x24"
+# Phone screen resolution. Lower = far less data to push over VNC = smoother.
+SKIN="720x1280"
 
 # Use our OWN SDK directory. Do NOT inherit the runner's $ANDROID_HOME: it points
 # at /usr/local/lib/android/sdk, which we delete below to free space, and which
@@ -101,6 +103,7 @@ fluxbox >/dev/null 2>&1 &
 # ---------------------------------------------------------------------------
 log "Booting the Android emulator (this takes a few minutes)"
 emulator -avd "${AVD_NAME}" \
+  -skin "${SKIN}" \
   -gpu swiftshader_indirect \
   -no-snapshot -no-audio -no-boot-anim \
   -camera-back none -camera-front none \
@@ -157,7 +160,7 @@ echo "#                                                             #"
 echo "#   YOUR CLOUD PHONE IS LIVE                                  #"
 echo "#                                                             #"
 echo "#   Open this link in any browser:                            #"
-echo "#     ${URL}/vnc.html?autoconnect=1&resize=scale"
+echo "#     ${URL}/vnc.html?autoconnect=1&resize=scale&quality=6&compression=2"
 echo "#                                                             #"
 echo "#   Click / tap = touch. Your keyboard types into Android.    #"
 echo "#   It stays up for ${DURATION_MIN} minutes, then disappears.     #"
