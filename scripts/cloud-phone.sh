@@ -2,18 +2,10 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root, and periodically back up user apps + their data (encrypted).
+# root, optionally enable ARM translation, and periodically back up user apps.
 #
-# Key design notes:
-#  * Everything runs in ONE process tree. GitHub Actions kills background
-#    processes when a step ends, so the emulator/server/tunnel all live here and
-#    the script sleeps at the end.
-#  * The emulator runs HEADLESS; scrcpy captures the framebuffer directly.
-#  * Root: `adb root` where the image allows it (google_apis), plus a best-effort
-#    Magisk install via rootAVD (pinned to a Magisk < 26, which can be patched
-#    non-interactively - Magisk >= 26 needs the manual "FAKEBOOTIMG" tap).
-#  * Backup: user apps' APKs + /data/user/0/<pkg> data, tarred and AES-encrypted
-#    with $BACKUP_PASSWORD, then force-pushed to a "backups" branch.
+# Everything runs in ONE process tree: GitHub Actions kills background processes
+# when a step ends, so the emulator/server/tunnel live here and the script sleeps.
 #
 set -euo pipefail
 
@@ -29,6 +21,14 @@ ENABLE_MAGISK="${ENABLE_MAGISK:-1}"
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
+ARM_TRANSLATION="${ARM_TRANSLATION:-0}"
+
+# The libndk ARM-translation Magisk module is built for Android 11 (API 30), so
+# when ARM translation is requested we pin the API level to match.
+if [ "${ARM_TRANSLATION}" = "1" ] && [ "${API_LEVEL}" != "30" ]; then
+  echo "NOTE: ARM translation targets Android 11 - overriding API level ${API_LEVEL} -> 30"
+  API_LEVEL=30
+fi
 
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="${ANDROID_HOME}"
@@ -167,6 +167,49 @@ if [ "${ENABLE_MAGISK}" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# ARM translation: let arm64-v8a / armeabi-v7a-only APKs install on the x86_64
+# emulator, via Google's libndk native bridge, installed as a Magisk module.
+# Best-effort and version-sensitive.
+if [ "${ARM_TRANSLATION}" = "1" ]; then
+  log "ARM translation: installing the libndk native bridge (best effort)"
+  set +e
+  as_root() { if [ "${ROOT_OK}" = "1" ]; then adb shell "$1"; else adb shell "su -c '$1'"; fi; }
+
+  if [ "${ROOT_OK}" != "1" ] && [ "${SU_OK}" != "1" ]; then
+    echo "No root available - cannot install the ARM translation module. Skipping."
+  else
+    sudo apt-get install -y -qq zip >/dev/null 2>&1 || true
+    rm -rf /tmp/armmod && mkdir -p /tmp/armmod
+    curl -sSL -o /tmp/armmod/mod.zip \
+      "https://codeload.github.com/ALEX5402/libndk_translation_Module/zip/refs/heads/master"
+    ( cd /tmp/armmod && unzip -q mod.zip )
+    MODDIR="$(ls -d /tmp/armmod/libndk_translation_Module-* 2>/dev/null | head -1)"
+    if [ -n "${MODDIR}" ]; then
+      # The module's installer hard-gates on Android 10; neutralise that gate.
+      sed -i 's/abort "Only support Android Virtual Devices.*/:/' "${MODDIR}/customize.sh"
+      sed -i 's/abort "Only support Android 10".*/:/' "${MODDIR}/customize.sh"
+      ( cd "${MODDIR}" && zip -qr /tmp/armmod/armtrans.zip . -x 'image.png' )
+      adb push /tmp/armmod/armtrans.zip /data/local/tmp/armtrans.zip >/dev/null 2>&1
+      as_root "magisk --install-module /data/local/tmp/armtrans.zip"
+      echo "Module installed; rebooting to apply."
+      adb reboot >/dev/null 2>&1 || true
+      sleep 15
+      if wait_boot; then
+        adb root >/dev/null 2>&1 || true
+        sleep 3
+        echo "ABIs after ARM translation:"
+        adb shell getprop ro.product.cpu.abilist | tr -d '\r'
+      else
+        echo "Reboot after ARM translation failed; continuing."
+      fi
+    else
+      echo "Could not unpack the ARM translation module."
+    fi
+  fi
+  set -e
+fi
+
+# ---------------------------------------------------------------------------
 do_backup() {
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
   local WORK OUT BUNDLE STAMP
@@ -183,7 +226,6 @@ do_backup() {
     mkdir -p "${WORK}/apps/${pkg}"
     adb shell am force-stop "${pkg}" >/dev/null 2>&1 || true
 
-    # APK(s)
     adb shell pm path "${pkg}" 2>/dev/null | sed 's/^package://' | tr -d '\r' | while read -r apk; do
       [ -n "${apk}" ] && adb pull "${apk}" "${WORK}/apps/${pkg}/" >/dev/null 2>&1 || true
     done
@@ -198,7 +240,6 @@ do_backup() {
       : > "${WORK}/apps/${pkg}/data.tar.gz"
     fi
 
-    # External data (browsers sometimes keep bits here)
     adb exec-out "tar -czf - -C /sdcard/Android/data ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/external.tar.gz" 2>/dev/null || true
   done < "${WORK}/applist.txt"
 
@@ -214,17 +255,21 @@ do_backup() {
   rm -rf "${WORK}" "${BUNDLE}"
   echo "Encrypted backup: $(du -h "${OUT}" | cut -f1)"
 
-  # Publish: force-push a single branch so the repo does not grow unbounded.
+  # Publish ONLY the newest snapshot: build a fresh single-file commit and
+  # force-push it to the 'backups' branch, so the branch never accumulates.
   (
     cd "${GITHUB_WORKSPACE:-$PWD}"
-    mkdir -p backups
-    cp "${OUT}" "backups/$(basename "${OUT}")"
     git config user.email "cloud-phone-bot@users.noreply.github.com"
     git config user.name "cloud-phone-bot"
-    git checkout -B backups >/dev/null 2>&1 || true
-    git add -f backups
-    git commit -m "Encrypted cloud phone backup ${STAMP}" >/dev/null 2>&1 || true
-    git push -f origin backups >/dev/null 2>&1 && echo "Backup pushed to branch 'backups'." \
+    BR="backup-${STAMP}"
+    git checkout --orphan "${BR}" >/dev/null 2>&1 || true
+    git rm -rf --cached . >/dev/null 2>&1 || true
+    mkdir -p backups
+    cp "${OUT}" "backups/$(basename "${OUT}")"
+    git add -f "backups/$(basename "${OUT}")"
+    git commit -m "Encrypted cloud phone backup ${STAMP} (latest only)" >/dev/null 2>&1 || true
+    git push -f origin "HEAD:refs/heads/backups" >/dev/null 2>&1 \
+      && echo "Backup pushed to 'backups' (latest only)." \
       || echo "Backup push failed (needs 'contents: write' permission)."
   )
   rm -f "${OUT}"
@@ -286,7 +331,7 @@ echo "#   Open this in your browser:                                #"
 echo "#     ${URL}"
 echo "#                                                             #"
 echo "#   Then: click your device, and pick 'proxy over adb'.       #"
-echo "#   Root: adb=${ROOT_OK} su=${SU_OK}                            #"
+echo "#   Root: adb=${ROOT_OK} su=${SU_OK}  ARM translation: ${ARM_TRANSLATION}   #"
 echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> branch 'backups'" || echo "off (no BACKUP_PASSWORD)")#"
 echo "#   Stays up for ${DURATION_MIN} minutes.                         #"
 echo "#                                                             #"
@@ -297,7 +342,7 @@ echo ""
 log "Keeping the phone alive for ${DURATION_MIN} minutes"
 NOW="$(date +%s)"
 END=$(( NOW + DURATION_MIN * 60 ))
-NEXT_BACKUP=$(( NOW + 60 ))   # first backup ~1 min in, then every interval
+NEXT_BACKUP=$(( NOW + 60 ))
 while [ "$(date +%s)" -lt "${END}" ]; do
   if ! kill -0 "${EMU_PID}" 2>/dev/null; then
     echo "Emulator process exited - stopping."
