@@ -2,7 +2,8 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root (optional), restore/back up user apps (encrypted), and capture crashes.
+# root (optional), restore/back up user + selected system apps (encrypted), and
+# capture crashes.
 #
 # Everything runs in ONE process tree: GitHub Actions kills background processes
 # when a step ends, so the emulator/server/tunnel live here and the script sleeps.
@@ -21,6 +22,9 @@ RAM_MB="${RAM_MB:-4096}"              # emulator RAM in MB (the runner has 16 GB
 CORES="${CORES:-4}"                   # emulator CPU cores (the runner has 4 vCPU)
 STORAGE="${STORAGE:-10G}"             # /data (internal storage) size
 RESTORE="${RESTORE:-1}"               # pull the newest backup back on boot?
+# System apps to preserve alongside user apps. pm path returns the ACTIVE apk,
+# so an updated system app yields the update, not the stale /system copy.
+SYSTEM_APPS="${SYSTEM_APPS:-com.android.vending com.android.chrome}"
 WS_PORT="${WS_PORT:-8000}"
 ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
@@ -321,8 +325,8 @@ restore_latest_backup() {
       [ -d "${d}" ] || continue
       pkg="$(basename "${d}")"
       echo "  restoring ${pkg}"
-      if adb install-multiple -r -g "${d}"*.apk >/dev/null 2>&1 \
-         || adb install -r -g "${d}"*.apk >/dev/null 2>&1; then
+      if adb install-multiple -r -d -g "${d}"*.apk >/dev/null 2>&1 \
+         || adb install -r -d -g "${d}"*.apk >/dev/null 2>&1; then
         RESTORED=$((RESTORED+1))
       else
         echo "    (apk install failed)"
@@ -331,6 +335,7 @@ restore_latest_backup() {
       # Private app data - only restorable with root.
       if [ -s "${d}data.tar.gz" ]; then
         if [ "${ROOT_OK}" = "1" ] || [ "${SU_OK}" = "1" ]; then
+          adb shell am force-stop "${pkg}" >/dev/null 2>&1 || true
           UG="$(adb shell stat -c '%u:%g' /data/user/0/${pkg} 2>/dev/null | tr -d '\r')"
           adb push "${d}data.tar.gz" /data/local/tmp/r.tar.gz >/dev/null 2>&1 || true
           adb shell "tar -xzf /data/local/tmp/r.tar.gz -C /data/user/0" >/dev/null 2>&1 || true
@@ -365,6 +370,28 @@ restore_latest_backup() {
   return 0
 }
 
+# Capture one package: its active APK(s), its private data (root only), and
+# its external data. Shared by the user-app and extra-system-app passes.
+backup_one_app() {
+  local pkg="$1" WORK="$2"
+  mkdir -p "${WORK}/apps/${pkg}"
+  adb shell am force-stop "${pkg}" >/dev/null 2>&1 || true
+
+  adb shell pm path "${pkg}" 2>/dev/null | sed 's/^package://' | tr -d '\r' | while read -r apk; do
+    [ -n "${apk}" ] && adb pull "${apk}" "${WORK}/apps/${pkg}/" >/dev/null 2>&1 || true
+  done
+
+  if [ "${ROOT_OK}" = "1" ]; then
+    adb exec-out "tar -czf - -C /data/user/0 ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
+  elif [ "${SU_OK}" = "1" ]; then
+    adb exec-out "su -c 'tar -czf - -C /data/user/0 ${pkg}'" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
+  else
+    : > "${WORK}/apps/${pkg}/data.tar.gz"
+  fi
+
+  adb exec-out "tar -czf - -C /sdcard/Android/data ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/external.tar.gz" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 do_backup() {
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
@@ -379,24 +406,18 @@ do_backup() {
   while read -r pkg; do
     [ -n "${pkg}" ] || continue
     echo "  - ${pkg}"
-    mkdir -p "${WORK}/apps/${pkg}"
-    adb shell am force-stop "${pkg}" >/dev/null 2>&1 || true
-
-    adb shell pm path "${pkg}" 2>/dev/null | sed 's/^package://' | tr -d '\r' | while read -r apk; do
-      [ -n "${apk}" ] && adb pull "${apk}" "${WORK}/apps/${pkg}/" >/dev/null 2>&1 || true
-    done
-
-    if [ "${ROOT_OK}" = "1" ]; then
-      adb exec-out "tar -czf - -C /data/user/0 ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
-    elif [ "${SU_OK}" = "1" ]; then
-      adb exec-out "su -c 'tar -czf - -C /data/user/0 ${pkg}'" > "${WORK}/apps/${pkg}/data.tar.gz" 2>/dev/null || true
-    else
-      echo "     (no root available - private data not captured)"
-      : > "${WORK}/apps/${pkg}/data.tar.gz"
-    fi
-
-    adb exec-out "tar -czf - -C /sdcard/Android/data ${pkg} 2>/dev/null" > "${WORK}/apps/${pkg}/external.tar.gz" 2>/dev/null || true
+    backup_one_app "${pkg}" "${WORK}"
   done < "${WORK}/applist.txt"
+
+  # System apps the user wants preserved across sessions (Play Store, Chrome,
+  # ...). Their APKs matter less than their DATA - the Google sign-in and
+  # Chrome's bookmarks/history live there.
+  for pkg in ${SYSTEM_APPS}; do
+    if adb shell pm path "${pkg}" 2>/dev/null | grep -q .; then
+      echo "  [system] ${pkg}"
+      backup_one_app "${pkg}" "${WORK}"
+    fi
+  done
 
   { echo "cloud-phone backup"; echo "timestamp: ${STAMP}"; echo "root: ${ROOT_OK}";
     echo "api-level: ${API_LEVEL}"; echo "target: ${TARGET}"; } > "${WORK}/MANIFEST.txt"
@@ -423,6 +444,22 @@ do_backup() {
   openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
     -pass env:BACKUP_PASSWORD -in "${BUNDLE}" -out "${OUT}"
   rm -rf "${WORK}" "${BUNDLE}"
+
+  # Safety net: never replace an existing backup with one less than half its
+  # size. That is exactly how a bare session used to wipe a good snapshot.
+  NEW_BYTES=$(stat -c %s "${OUT}" 2>/dev/null || echo 0)
+  OLD_BYTES=0
+  if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+    OLD_BYTES=$(curl -sSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+      "https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/backups?ref=backups" 2>/dev/null \
+      | jq -r '.[]?|.size' 2>/dev/null | sort -n | tail -1)
+    [ -n "${OLD_BYTES}" ] || OLD_BYTES=0
+  fi
+  if [ "${OLD_BYTES}" -gt 0 ] && [ "${NEW_BYTES}" -lt $(( OLD_BYTES / 2 )) ]; then
+    echo "New backup (${NEW_BYTES}B) is under half the existing one (${OLD_BYTES}B) - keeping the existing backup."
+    rm -f "${OUT}"
+    return 0
+  fi
   echo "Encrypted backup: $(du -h "${OUT}" | cut -f1)"
 
   # Publish ONLY the newest snapshot: build a fresh single-file commit and
