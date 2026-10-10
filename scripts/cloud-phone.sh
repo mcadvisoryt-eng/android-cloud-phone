@@ -9,9 +9,9 @@
 #
 set -euo pipefail
 
-API_LEVEL="${API_LEVEL:-29}"          # Android 10 by default: light + fast
+API_LEVEL="${API_LEVEL:-30}"          # Android 11: best emulator performance
 ARCH="${ARCH:-x86_64}"
-TARGET="${TARGET:-default}"           # AOSP by default (no Google) for speed
+TARGET="${TARGET:-google_apis}"       # Google APIs, no Play Store: lighter than playstore
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
@@ -370,7 +370,8 @@ while [ "$(date +%s)" -lt "${END}" ]; do
     APPS=$(adb shell pm list packages -3 2>/dev/null | wc -l)
     MEM=$(adb shell cat /proc/meminfo 2>/dev/null | awk '/MemAvailable/{print int($2/1024)" MB"}')
     if [ -n "${BACKUP_PASSWORD}" ]; then NB="$(( (NEXT_BACKUP - TS) / 60 )) min"; else NB="n/a"; fi
-    notify "Cloud Phone status" "Remaining: ${LEFT} min (of ${DURATION_MIN})
+    notify "Cloud Phone status" "URL: ${URL}
+Remaining: ${LEFT} min (of ${DURATION_MIN})
 Uptime: ${UPTIME} min
 User apps: ${APPS}
 Free RAM: ${MEM}
@@ -383,7 +384,8 @@ Next backup in: ${NB}" default "bar_chart"
     adb reboot >/dev/null 2>&1 || true
     sleep 20
     wait_boot || echo "Scheduled reboot failed."
-    notify "Cloud Phone back up" "Emulator rebooted and back online." default "white_check_mark"
+    notify "Cloud Phone back up" "Emulator rebooted and back online.
+URL: ${URL}" default "white_check_mark"
     NEXT_RESTART=$(( $(date +%s) + RESTART_EVERY_MIN * 60 ))
   fi
   sleep 30
