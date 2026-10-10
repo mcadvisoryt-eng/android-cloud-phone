@@ -13,7 +13,7 @@ on:
         required: true
         default: "300"
       target:
-        description: "System image. *_atd = stripped CI build (lightest/smoothest)"
+        description: "System image. google_apis = root + ARM + Play Services (recommended)"
         required: true
         default: "google_apis"
         type: choice
@@ -63,6 +63,10 @@ on:
         description: "Extra system apps to back up/restore (space-separated package names)"
         required: true
         default: "com.android.vending com.android.chrome"
+      backup_max_mb:
+        description: "Max backup size in MB before /sdcard files are dropped (git rejects >100)"
+        required: true
+        default: "90"
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
@@ -111,6 +115,7 @@ jobs:
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
+          BACKUP_MAX_MB: ${{ inputs.backup_max_mb }}
           # ntfy notifications. Add a repo secret named NTFY_TOPIC (your topic).
           # Optional: NTFY_SERVER for a self-hosted ntfy (defaults to ntfy.sh).
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
