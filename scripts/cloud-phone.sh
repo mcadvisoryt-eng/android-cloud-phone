@@ -2,7 +2,7 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root (optional), and periodically back up user apps (encrypted).
+# root (optional), back up user apps (encrypted), and capture app crashes.
 #
 # Everything runs in ONE process tree: GitHub Actions kills background processes
 # when a step ends, so the emulator/server/tunnel live here and the script sleeps.
@@ -26,6 +26,8 @@ NTFY_TOPIC="${NTFY_TOPIC:-}"
 NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
 NOTIFY_INTERVAL_MIN="${NOTIFY_INTERVAL_MIN:-30}"
 RESTART_EVERY_MIN="${RESTART_EVERY_MIN:-0}"
+CRASH_LOG="/tmp/cloudphone-crashes.log"   # app crashes captured during the session
+CRASH_SEEN=0
 
 # ARM-only apps need the API 30 image, which is the one that ships Google's
 # libndk native bridge. So requesting ARM translation pins the API level.
@@ -73,6 +75,34 @@ wait_boot() {
 
 is_root() {
   [ "$(adb shell id -u 2>/dev/null | tr -d '\r')" = "0" ]
+}
+
+# ---- crash capture -------------------------------------------------------
+# Stream the Android crash buffer to a file so nothing is missed, then report
+# any new crash (Java exception, native signal, ANR) as it happens.
+start_crash_watcher() {
+  adb logcat -b crash -c >/dev/null 2>&1 || true
+  : > "${CRASH_LOG}"
+  adb logcat -b crash -v threadtime >> "${CRASH_LOG}" 2>&1 &
+  LOGCAT_PID=$!
+}
+
+check_crashes() {
+  [ -f "${CRASH_LOG}" ] || return 0
+  local CUR NEW APP REASON
+  CUR=$(wc -c < "${CRASH_LOG}" 2>/dev/null || echo 0)
+  [ "${CUR}" -gt "${CRASH_SEEN}" ] || return 0
+  NEW="$(tail -c +$(( CRASH_SEEN + 1 )) "${CRASH_LOG}" 2>/dev/null || true)"
+  CRASH_SEEN="${CUR}"
+  [ -n "${NEW}" ] || return 0
+  APP="$(printf '%s' "${NEW}" | grep -m1 -oE 'Process: [^,]+' || true)"
+  REASON="$(printf '%s' "${NEW}" | grep -m1 -E 'FATAL EXCEPTION|Fatal signal|SIGSEGV|SIGABRT|Caused by|Exception|Error' || true)"
+  echo "--- crash captured ---"
+  printf '%s\n' "${NEW}" | tail -30
+  notify "Cloud Phone: APP CRASHED" "${APP:-A process crashed}
+${REASON:-see log}
+
+$(printf '%s' "${NEW}" | tail -12)" high "boom"
 }
 
 # ---------------------------------------------------------------------------
@@ -211,6 +241,11 @@ if [ "${ARM_TRANSLATION}" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+log "Starting the crash watcher (captures app crashes as they happen)"
+start_crash_watcher
+echo "Crash watcher running - crashes will be reported and bundled with the backup."
+
+# ---------------------------------------------------------------------------
 do_backup() {
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
   local WORK OUT BUNDLE STAMP
@@ -246,6 +281,7 @@ do_backup() {
   { echo "cloud-phone backup"; echo "timestamp: ${STAMP}"; echo "root: ${ROOT_OK}";
     echo "api-level: ${API_LEVEL}"; echo "target: ${TARGET}"; } > "${WORK}/MANIFEST.txt"
   adb shell pm list packages 2>/dev/null | tr -d '\r' > "${WORK}/packages-all.txt" || true
+  [ -f "${CRASH_LOG}" ] && cp "${CRASH_LOG}" "${WORK}/crashes.log" || true
 
   BUNDLE="/tmp/cloudphone-bundle.tar.gz"
   tar -czf "${BUNDLE}" -C "${WORK}" .
@@ -360,6 +396,7 @@ while [ "$(date +%s)" -lt "${END}" ]; do
     break
   fi
   TS="$(date +%s)"
+  check_crashes
   if [ -n "${BACKUP_PASSWORD}" ] && [ "${TS}" -ge "${NEXT_BACKUP}" ]; then
     do_backup || echo "Backup attempt failed; will retry next interval."
     NEXT_BACKUP=$(( $(date +%s) + BACKUP_INTERVAL_MIN * 60 ))
@@ -384,6 +421,7 @@ Next backup in: ${NB}" default "bar_chart"
     adb reboot >/dev/null 2>&1 || true
     sleep 20
     wait_boot || echo "Scheduled reboot failed."
+    start_crash_watcher
     notify "Cloud Phone back up" "Emulator rebooted and back online.
 URL: ${URL}" default "white_check_mark"
     NEXT_RESTART=$(( $(date +%s) + RESTART_EVERY_MIN * 60 ))
@@ -396,5 +434,6 @@ if [ -n "${BACKUP_PASSWORD}" ]; then
   do_backup || echo "Final backup failed."
 fi
 
-notify "Cloud Phone ended" "Session finished." default "checkered_flag"
+CRASHES=$(grep -c -E 'FATAL EXCEPTION|Fatal signal|ANR in' "${CRASH_LOG}" 2>/dev/null || echo 0)
+notify "Cloud Phone ended" "Session finished. Crash entries captured: ${CRASHES}." default "checkered_flag"
 echo "Session finished."
