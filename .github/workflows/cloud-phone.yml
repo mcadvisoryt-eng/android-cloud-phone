@@ -5,22 +5,24 @@ on:
   workflow_dispatch:
     inputs:
       api_level:
-        description: "Android API level (24=Android 7, 29=Android 10, 33, 34)"
+        description: "Android API level (30=Android 11 recommended; 24=7, 33, 34)"
         required: true
-        default: "29"
+        default: "30"
       duration_minutes:
         description: "How long to keep the phone alive (minutes, max ~340)"
         required: true
         default: "300"
       target:
-        description: "System image: default=AOSP (lightest, no Google)"
+        description: "System image. *_atd = stripped CI build (lightest/smoothest)"
         required: true
-        default: "default"
+        default: "google_apis"
         type: choice
         options:
-          - default
           - google_apis
           - google_apis_playstore
+          - google_atd
+          - aosp_atd
+          - default
       magisk:
         description: "Install Magisk (root)? Optional - off by default."
         required: true
