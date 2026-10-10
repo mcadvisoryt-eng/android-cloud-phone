@@ -59,6 +59,10 @@ on:
         options:
           - "yes"
           - "no"
+      system_apps:
+        description: "Extra system apps to back up/restore (space-separated package names)"
+        required: true
+        default: "com.android.vending com.android.chrome"
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
@@ -99,6 +103,9 @@ jobs:
           # Internal storage (/data). Stock AVD gives ~1-2 GB, which is unusable.
           STORAGE: ${{ inputs.storage }}
           RESTORE: ${{ inputs.restore == 'yes' && '1' || '0' }}
+          # System apps whose data should survive between sessions
+          # (Play Store = your Google sign-in, Chrome = bookmarks/history).
+          SYSTEM_APPS: ${{ inputs.system_apps }}
           # Needed to read the latest backup back from the 'backups' branch.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
