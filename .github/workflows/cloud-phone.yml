@@ -5,32 +5,32 @@ on:
   workflow_dispatch:
     inputs:
       api_level:
-        description: "Android API level (e.g. 30, 33, 34)"
+        description: "Android API level (24=Android 7, 29=Android 10, 33, 34)"
         required: true
-        default: "33"
+        default: "29"
       duration_minutes:
         description: "How long to keep the phone alive (minutes, max ~340)"
         required: true
         default: "300"
       target:
-        description: "System image target"
+        description: "System image: default=AOSP (lightest, no Google)"
         required: true
-        default: "google_apis_playstore"
+        default: "default"
         type: choice
         options:
-          - google_apis_playstore
-          - google_apis
           - default
+          - google_apis
+          - google_apis_playstore
       magisk:
-        description: "Try to install Magisk (root)?"
+        description: "Install Magisk (root)? Optional - off by default."
         required: true
-        default: "yes"
+        default: "no"
         type: choice
         options:
-          - "yes"
           - "no"
+          - "yes"
       arm_translation:
-        description: "Use API 30 (which ships ARM/libndk translation) so arm64-only APKs can run?"
+        description: "Use API 30 (ships ARM/libndk translation) for arm64-only APKs?"
         required: true
         default: "no"
         type: choice
@@ -71,4 +71,10 @@ jobs:
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
+          # ntfy notifications. Add a repo secret named NTFY_TOPIC (your topic).
+          # Optional: NTFY_SERVER for a self-hosted ntfy (defaults to ntfy.sh).
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER || 'https://ntfy.sh' }}
+          NOTIFY_INTERVAL_MIN: "30"
+          RESTART_EVERY_MIN: "0"
         run: bash scripts/cloud-phone.sh
