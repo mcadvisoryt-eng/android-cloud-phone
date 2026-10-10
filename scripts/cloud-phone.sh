@@ -2,7 +2,7 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root (optional), back up user apps (encrypted), and capture app crashes.
+# root (optional), restore/back up user apps (encrypted), and capture crashes.
 #
 # Everything runs in ONE process tree: GitHub Actions kills background processes
 # when a step ends, so the emulator/server/tunnel live here and the script sleeps.
@@ -20,6 +20,7 @@ RESOLUTION="${RESOLUTION:-540x960}"   # device screen: fewer pixels = much smoot
 RAM_MB="${RAM_MB:-4096}"              # emulator RAM in MB (the runner has 16 GB)
 CORES="${CORES:-4}"                   # emulator CPU cores (the runner has 4 vCPU)
 STORAGE="${STORAGE:-10G}"             # /data (internal storage) size
+RESTORE="${RESTORE:-1}"               # pull the newest backup back on boot?
 WS_PORT="${WS_PORT:-8000}"
 ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
@@ -278,6 +279,92 @@ log "Starting the crash watcher (captures app crashes as they happen)"
 start_crash_watcher
 echo "Crash watcher running - crashes will be reported and bundled with the backup."
 
+# ---- restore -------------------------------------------------------------
+# Pull the newest encrypted backup from the 'backups' branch and put the apps
+# (and their data) back onto this fresh emulator.
+restore_latest_backup() {
+  [ "${RESTORE}" = "1" ] || { echo "Restore disabled by input."; return 0; }
+  [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD - nothing to restore."; return 0; }
+  [ -n "${GITHUB_REPOSITORY:-}" ] || { echo "No GITHUB_REPOSITORY - skipping restore."; return 0; }
+
+  local API LIST LATEST WORK ENC RESTORED FAILED UG
+  API="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/backups?ref=backups"
+  LIST="$(curl -sSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+            -H "Accept: application/vnd.github+json" "${API}" 2>/dev/null || true)"
+  LATEST="$(printf '%s' "${LIST}" | jq -r '.[]? | select(.name|endswith(".tar.gz.enc")) | .name' 2>/dev/null | sort | tail -1)"
+  if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
+    echo "No backup on the 'backups' branch yet - starting fresh."
+    return 0
+  fi
+  echo "Restoring from ${LATEST}"
+
+  ENC="/tmp/restore.enc"
+  if ! curl -sSL --max-time 300 -o "${ENC}" \
+        "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/backups/backups/${LATEST}"; then
+    echo "Backup download failed - continuing without restore."
+    return 0
+  fi
+
+  WORK="$(mktemp -d)"
+  if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+        -pass env:BACKUP_PASSWORD -in "${ENC}" | tar -xzf - -C "${WORK}" 2>/dev/null; then
+    echo "Decrypt/extract failed - is BACKUP_PASSWORD the same as when it was made?"
+    notify "Cloud Phone: restore failed" "Could not decrypt ${LATEST}. Wrong BACKUP_PASSWORD?" high "x"
+    rm -rf "${WORK}" "${ENC}"
+    return 0
+  fi
+  rm -f "${ENC}"
+
+  RESTORED=0; FAILED=0
+  if [ -d "${WORK}/apps" ]; then
+    for d in "${WORK}"/apps/*/; do
+      [ -d "${d}" ] || continue
+      pkg="$(basename "${d}")"
+      echo "  restoring ${pkg}"
+      if adb install-multiple -r -g "${d}"*.apk >/dev/null 2>&1 \
+         || adb install -r -g "${d}"*.apk >/dev/null 2>&1; then
+        RESTORED=$((RESTORED+1))
+      else
+        echo "    (apk install failed)"
+        FAILED=$((FAILED+1))
+      fi
+      # Private app data - only restorable with root.
+      if [ -s "${d}data.tar.gz" ]; then
+        if [ "${ROOT_OK}" = "1" ] || [ "${SU_OK}" = "1" ]; then
+          UG="$(adb shell stat -c '%u:%g' /data/user/0/${pkg} 2>/dev/null | tr -d '\r')"
+          adb push "${d}data.tar.gz" /data/local/tmp/r.tar.gz >/dev/null 2>&1 || true
+          adb shell "tar -xzf /data/local/tmp/r.tar.gz -C /data/user/0" >/dev/null 2>&1 || true
+          [ -n "${UG}" ] && adb shell "chown -R ${UG} /data/user/0/${pkg}" >/dev/null 2>&1 || true
+          adb shell "restorecon -R /data/user/0/${pkg}" >/dev/null 2>&1 || true
+          adb shell "rm -f /data/local/tmp/r.tar.gz" >/dev/null 2>&1 || true
+        else
+          echo "    (no root - private data not restored)"
+        fi
+      fi
+      # External (shared) app data.
+      if [ -s "${d}external.tar.gz" ]; then
+        adb push "${d}external.tar.gz" /data/local/tmp/e.tar.gz >/dev/null 2>&1 || true
+        adb shell "mkdir -p /sdcard/Android/data/${pkg}" >/dev/null 2>&1 || true
+        adb shell "tar -xzf /data/local/tmp/e.tar.gz -C /sdcard/Android/data" >/dev/null 2>&1 || true
+        adb shell "rm -f /data/local/tmp/e.tar.gz" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+
+  # User files from /sdcard.
+  if [ -s "${WORK}/sdcard.tar.gz" ]; then
+    echo "  restoring /sdcard user files"
+    adb push "${WORK}/sdcard.tar.gz" /data/local/tmp/s.tar.gz >/dev/null 2>&1 || true
+    adb shell "tar -xzf /data/local/tmp/s.tar.gz -C /sdcard" >/dev/null 2>&1 || true
+    adb shell "rm -f /data/local/tmp/s.tar.gz" >/dev/null 2>&1 || true
+  fi
+
+  rm -rf "${WORK}"
+  echo "Restore done: ${RESTORED} app(s) installed, ${FAILED} failed."
+  notify "Cloud Phone: restored" "Restored ${RESTORED} app(s) from ${LATEST}." default "inbox_tray"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 do_backup() {
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
@@ -316,6 +403,20 @@ do_backup() {
   adb shell pm list packages 2>/dev/null | tr -d '\r' > "${WORK}/packages-all.txt" || true
   [ -f "${CRASH_LOG}" ] && cp "${CRASH_LOG}" "${WORK}/crashes.log" || true
 
+  # User files on /sdcard (Downloads, Pictures, ...). App-private Android/ is
+  # handled per-app above.
+  adb exec-out "tar -czf - -C /sdcard --exclude=Android . 2>/dev/null" > "${WORK}/sdcard.tar.gz" 2>/dev/null || true
+
+  # Never let an empty session's snapshot overwrite a good one.
+  APP_COUNT=$(grep -c . "${WORK}/applist.txt" 2>/dev/null || echo 0)
+  SDCARD_BYTES=$(stat -c %s "${WORK}/sdcard.tar.gz" 2>/dev/null || echo 0)
+  if [ "${APP_COUNT}" -eq 0 ] && [ "${SDCARD_BYTES}" -lt 10000 ]; then
+    echo "Nothing to back up (0 user apps, no user files) - keeping the existing backup."
+    rm -rf "${WORK}"
+    return 0
+  fi
+  echo "Backup contents: ${APP_COUNT} user app(s), /sdcard ${SDCARD_BYTES} bytes"
+
   BUNDLE="/tmp/cloudphone-bundle.tar.gz"
   tar -czf "${BUNDLE}" -C "${WORK}" .
   OUT="/tmp/cloudphone-backup-${STAMP}.tar.gz.enc"
@@ -337,14 +438,18 @@ do_backup() {
     cp "${OUT}" "backups/$(basename "${OUT}")"
     git add -f "backups/$(basename "${OUT}")"
     git commit -m "Encrypted cloud phone backup ${STAMP} (latest only)" >/dev/null 2>&1 || true
-    git push -f origin "HEAD:refs/heads/backups" >/dev/null 2>&1 \
-      && echo "Backup pushed to 'backups' (latest only)." \
-      || echo "Backup push failed (needs 'contents: write' permission)."
-  )
+    git push -f origin "HEAD:refs/heads/backups" >/dev/null 2>&1
+  ) && {
+    echo "Backup pushed to 'backups' (latest only)."
+    notify "Cloud Phone: backup pushed" "Encrypted snapshot pushed to branch 'backups' (newest only)." low "floppy_disk"
+  } || echo "Backup push failed (needs 'contents: write' permission)."
   rm -f "${OUT}"
-  notify "Cloud Phone: backup pushed" "Encrypted snapshot pushed to branch 'backups' (newest only)." low "floppy_disk"
   return 0
 }
+
+# ---------------------------------------------------------------------------
+log "Restoring the newest backup (if any)"
+restore_latest_backup
 
 # ---------------------------------------------------------------------------
 log "Building ws-scrcpy (H.264 streaming server)"
