@@ -19,6 +19,7 @@ MAX_SIZE="${MAX_SIZE:-540}"           # scrcpy downscale (lower = smoother)
 RESOLUTION="${RESOLUTION:-540x960}"   # device screen: fewer pixels = much smoother
 RAM_MB="${RAM_MB:-4096}"              # emulator RAM in MB (the runner has 16 GB)
 CORES="${CORES:-4}"                   # emulator CPU cores (the runner has 4 vCPU)
+STORAGE="${STORAGE:-10G}"             # /data (internal storage) size
 WS_PORT="${WS_PORT:-8000}"
 ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
@@ -154,8 +155,15 @@ echo "no" | avdmanager create avd \
 AVD_INI="${ANDROID_AVD_HOME}/${AVD_NAME}.avd/config.ini"
 if [ -f "${AVD_INI}" ]; then
   sed -i '/^hw\.lcd\.width=/d; /^hw\.lcd\.height=/d; /^hw\.lcd\.density=/d' "${AVD_INI}"
+  sed -i '/^disk\.dataPartition\.size=/d; /^disk\.cachePartition\.size=/d; /^sdcard\.size=/d' "${AVD_INI}"
   printf 'hw.lcd.width=%s\nhw.lcd.height=%s\nhw.lcd.density=%s\n' \
     "${SCREEN_W}" "${SCREEN_H}" "${DENSITY}" >> "${AVD_INI}"
+  # Internal storage. The stock AVD gives /data only ~1-2 GB, which fills up
+  # on the first app install. Set it before first boot so the partition is
+  # created at this size (no factory reset needed on a fresh AVD).
+  printf 'disk.dataPartition.size=%s\n' "${STORAGE}" >> "${AVD_INI}"
+  printf 'disk.cachePartition.size=512M\n' >> "${AVD_INI}"
+  echo "Configured /data = ${STORAGE}"
 fi
 
 echo "AVDs seen by emulator:"; emulator -list-avds || true
@@ -183,8 +191,11 @@ for s in window_animation_scale transition_animation_scale animator_duration_sca
   adb shell settings put global "$s" 0 >/dev/null 2>&1 || true
 done
 echo "  animations disabled; screen ${SCREEN_W}x${SCREEN_H} @ ${DENSITY}dpi; ${RAM_MB} MB RAM, ${CORES} cores"
+log "Storage available inside Android"
+adb shell df -h /data 2>/dev/null | tail -1 || true
+adb shell df -h /sdcard 2>/dev/null | tail -1 || true
 notify "Cloud Phone: VM started" "Android ${API_LEVEL} (${TARGET}) emulator booted.
-Screen ${SCREEN_W}x${SCREEN_H} @${DENSITY}dpi, ${RAM_MB} MB RAM, ${CORES} cores." default "phone"
+Screen ${SCREEN_W}x${SCREEN_H} @${DENSITY}dpi, ${RAM_MB} MB RAM, ${CORES} cores, /data ${STORAGE}." default "phone"
 
 log "Device ABI support (decides whether ARM-only APKs can install)"
 for p in ro.product.cpu.abilist ro.product.cpu.abilist64 ro.product.cpu.abilist32 \
