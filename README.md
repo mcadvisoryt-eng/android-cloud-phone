@@ -21,7 +21,8 @@ Settings -> Secrets and variables -> Actions -> New repository secret.
 | `BACKUP_PASSWORD` | Enables the encrypted app-data backup (AES-256). |
 
 Subscribe to your topic in the ntfy app (or open `https://ntfy.sh/<topic>`) and
-you'll get push messages for the events below.
+you'll get push messages for the events below. **Every status notification
+includes the phone's URL**, so you never have to dig through the log for it.
 
 ---
 
@@ -29,8 +30,8 @@ you'll get push messages for the events below.
 
 | Setting | Default | Why |
 |---|---|---|
-| `api_level` | **29** (Android 10) | Far lighter than 33; boots faster, runs smoother. Use `24` (Android 7) for even less. |
-| `target` | **`default`** (AOSP) | No Google services = no bloat, fastest boot. |
+| `api_level` | **30** (Android 11) | Measurably smoother than 29/33 on the emulator. |
+| `target` | **`google_apis`** | Google APIs without Play Store bloat. `aosp_atd`/`google_atd` are Google's stripped CI builds - the lightest option. |
 | `magisk` | **`no`** | Root is optional; skip it and the run is quicker. |
 | `arm_translation` | **`no`** | Only needed for ARM-only APKs. |
 
@@ -49,9 +50,9 @@ Set `NTFY_TOPIC` and the script pushes a notification for:
 - **LIVE** - the phone is up, including its URL and session length.
 - **Root** - result of the optional Magisk step (`adb=... su=...`).
 - **Backup pushed** - an encrypted snapshot landed on the `backups` branch.
-- **Status** - every `NOTIFY_INTERVAL_MIN` (default 30): **remaining time**,
-  uptime, user-app count, free RAM, root state, and **time until the next
-  backup**.
+- **Status** - every `NOTIFY_INTERVAL_MIN` (default 30): **the URL**, remaining
+  time, uptime, user-app count, free RAM, root state, and time until the next
+  backup.
 - **Restarting / back up** - only if `RESTART_EVERY_MIN` is set (default 0 = off);
   reboots the emulator on a schedule and tells you.
 - **DIED** - the emulator exited unexpectedly.
@@ -66,14 +67,10 @@ Tune the cadence with `NOTIFY_INTERVAL_MIN` and enable scheduled reboots with
 
 1. **Actions** tab -> **Cloud Phone** -> **Run workflow**.
 2. Set the inputs (defaults are fine for a light, fast phone).
-3. Wait ~10-15 minutes (less than before - no Google image, no root step).
-4. In the job log, find the banner:
-   ```
-   #   YOUR CLOUD PHONE IS LIVE  (scrcpy / H.264)
-   #     https://<random>.trycloudflare.com
-   ```
-5. Open it, **click your device, and pick `proxy over adb`**. Mouse/tap = touch.
-6. When done, **cancel the run**.
+3. Wait ~10-15 minutes.
+4. In the job log (or the ntfy notification) find the URL, open it, **click your
+device, and pick `proxy over adb`**. Mouse/tap = touch.
+5. When done, **cancel the run**.
 
 ---
 
@@ -81,9 +78,25 @@ Tune the cadence with `NOTIFY_INTERVAL_MIN` and enable scheduled reboots with
 
 Some apps (e.g. MovieBox) ship only `arm64-v8a` libraries and refuse to install
 on an x86_64 emulator. The **API 30** image ships Google's **libndk** native
-bridge, so they work there - set **arm_translation: yes** (which forces API 30).
-API 33 and newer do **not** include it, and such apps fail with *"app isn't
-compatible with your phone"*.
+bridge, so they work there - set **arm_translation: yes**. API 33 and newer do
+**not** include it, and such apps fail with *"app isn't compatible with your
+phone"*.
+
+---
+
+## Custom ROMs / smoothest experience
+
+The Android emulator can only run **Google's emulator system images** - you can't
+flash LineageOS, BlissOS or similar onto an AVD. The closest thing to a "custom
+ROM tuned for this" is Google's own **ATD** images (`aosp_atd`, `google_atd`):
+stripped CI builds that cut CPU/RAM use roughly in half by removing apps and
+services you don't need. Pick one of those targets for the lightest, smoothest
+phone.
+
+If you genuinely want a different ROM, that means leaving the emulator:
+**redroid** (Android in a Docker container) can run custom images and even
+bundles ARM translation - but it needs `binder_linux`/`ashmem_linux` kernel
+modules on the host, which is a different setup from this repo.
 
 ---
 
@@ -108,7 +121,8 @@ data is bound to the device keychain.
 
 ## Root (optional)
 
-- On `default` / `google_apis` images, **`adb root`** just works.
+- On `google_apis` / `default` images, **`adb root`** just works (so backups get
+  full app data with no Magisk needed).
 - **Magisk** (via [rootAVD](https://github.com/newbit1/rootAVD), pinned to 25.2)
   is best-effort and off by default. **KernelSU is not possible** - it needs a
   custom kernel that isn't published for the emulator.
