@@ -39,6 +39,14 @@ on:
         options:
           - "no"
           - "yes"
+      resolution:
+        description: "Screen size - 540x960 smoothest, 720x1280 sharper, 1080x1920 sharpest"
+        required: true
+        default: "540x960"
+      max_size:
+        description: "Stream downscale cap (540 smoothest, 720 sharper)"
+        required: true
+        default: "540"
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
@@ -70,6 +78,12 @@ jobs:
           ENABLE_MAGISK: ${{ inputs.magisk == 'yes' && '1' || '0' }}
           MAGISK_VER: "25.2"
           ARM_TRANSLATION: ${{ inputs.arm_translation == 'yes' && '1' || '0' }}
+          # Smoothness: smaller screen + a properly-sized emulator.
+          # Public-repo runners give 4 vCPU / 16 GB, so use them.
+          RESOLUTION: ${{ inputs.resolution }}
+          MAX_SIZE: ${{ inputs.max_size }}
+          RAM_MB: "4096"
+          CORES: "4"
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
