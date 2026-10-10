@@ -51,6 +51,14 @@ on:
         description: "Internal storage (/data) size - e.g. 10G, 12G, 16G"
         required: true
         default: "10G"
+      restore:
+        description: "Restore the newest backup onto a fresh phone at boot?"
+        required: true
+        default: "yes"
+        type: choice
+        options:
+          - "yes"
+          - "no"
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
@@ -90,6 +98,9 @@ jobs:
           CORES: "4"
           # Internal storage (/data). Stock AVD gives ~1-2 GB, which is unusable.
           STORAGE: ${{ inputs.storage }}
+          RESTORE: ${{ inputs.restore == 'yes' && '1' || '0' }}
+          # Needed to read the latest backup back from the 'backups' branch.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Add a repo secret named BACKUP_PASSWORD to enable encrypted backups.
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
