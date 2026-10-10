@@ -31,6 +31,10 @@ MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactiv
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
 BACKUP_MAX_MB="${BACKUP_MAX_MB:-90}"   # git rejects files over 100 MB - stay under it
+# Off-site destination for backups too big for a git branch. Optional: when
+# set, the full backup (including /sdcard) is uploaded there and the 'backups'
+# branch carries only a small pointer to it.
+PIXELDRAIN_API_KEY="${PIXELDRAIN_API_KEY:-}"
 ARM_TRANSLATION="${ARM_TRANSLATION:-0}"
 NTFY_TOPIC="${NTFY_TOPIC:-}"
 NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
@@ -264,10 +268,10 @@ fi
 
 # ---------------------------------------------------------------------------
 # ARM translation. Finding from a real run: the API 30 (Android 11)
-# google_apis_playstore image ALREADY ships Google's libndk native bridge and
-# advertises arm64-v8a / armeabi-v7a, so ARM-only APKs install with no extra
-# work. (Newer images, e.g. API 33, do not.) Enabling this therefore just means
-# "use API 30" - no Magisk module is required.
+# google_apis / google_apis_playstore images ALREADY ship Google's libndk
+# native bridge and advertise arm64-v8a / armeabi-v7a, so ARM-only APKs install
+# with no extra work. (Newer images, e.g. API 33, do not.) Enabling this
+# therefore just means "use API 30" - no Magisk module is required.
 if [ "${ARM_TRANSLATION}" = "1" ]; then
   log "ARM translation: using the image's built-in libndk native bridge"
   echo "  native bridge : $(adb shell getprop ro.dalvik.vm.native.bridge 2>/dev/null | tr -d '\r')"
@@ -284,29 +288,89 @@ log "Starting the crash watcher (captures app crashes as they happen)"
 start_crash_watcher
 echo "Crash watcher running - crashes will be reported and bundled with the backup."
 
+# ---- pixeldrain ----------------------------------------------------------
+# Auth uses the API key in the HTTP Basic *password* field; the username is
+# ignored. Upload is a raw PUT to /api/file/<name> and returns {"id": ...}.
+pixeldrain_upload() {
+  local file="$1" resp id
+  resp="$(curl -sS --max-time 1800 -T "${file}" -u ":${PIXELDRAIN_API_KEY}" \
+            "https://pixeldrain.com/api/file/$(basename "${file}")" 2>/dev/null || true)"
+  id="$(printf '%s' "${resp}" | jq -r '.id // empty' 2>/dev/null || true)"
+  if printf '%s' "${resp}" | jq -e '.success == true' >/dev/null 2>&1 && [ -n "${id}" ]; then
+    printf '%s' "${id}"
+    return 0
+  fi
+  echo "  Pixeldrain upload failed: ${resp}" >&2
+  return 1
+}
+
+pixeldrain_delete() {
+  [ -n "${1:-}" ] || return 0
+  curl -sS --max-time 60 -X DELETE -u ":${PIXELDRAIN_API_KEY}" \
+    "https://pixeldrain.com/api/file/$1" >/dev/null 2>&1 || true
+}
+
+# Keep only a tiny pointer on the 'backups' branch so restore can find the blob.
+write_pointer() {
+  local id="$1" size="$2" name="$3" stamp="$4"
+  (
+    cd "${GITHUB_WORKSPACE:-$PWD}"
+    git config user.email "cloud-phone-bot@users.noreply.github.com"
+    git config user.name "cloud-phone-bot"
+    git checkout --orphan "ptr-${stamp}" >/dev/null 2>&1 || true
+    git rm -rf --cached . >/dev/null 2>&1 || true
+    mkdir -p backups
+    printf 'pixeldrain_id=%s\nname=%s\nsize=%s\ntimestamp=%s\n' \
+      "${id}" "${name}" "${size}" "${stamp}" > backups/latest.txt
+    git add -f backups/latest.txt
+    git commit -m "Backup pointer ${stamp}" >/dev/null 2>&1 || true
+    git push -f origin "HEAD:refs/heads/backups"
+  ) >/tmp/push.log 2>&1
+}
+
 # ---- restore -------------------------------------------------------------
-# Pull the newest encrypted backup from the 'backups' branch and put the apps
-# (and their data) back onto this fresh emulator.
+# Pull the newest backup (Pixeldrain via the pointer, or a blob on the branch)
+# and put the apps and their data back onto this fresh emulator.
 restore_latest_backup() {
   [ "${RESTORE}" = "1" ] || { echo "Restore disabled by input."; return 0; }
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD - nothing to restore."; return 0; }
   [ -n "${GITHUB_REPOSITORY:-}" ] || { echo "No GITHUB_REPOSITORY - skipping restore."; return 0; }
 
-  local API LIST LATEST WORK ENC RESTORED FAILED UG
-  API="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/backups?ref=backups"
-  LIST="$(curl -sSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
-            -H "Accept: application/vnd.github+json" "${API}" 2>/dev/null || true)"
-  LATEST="$(printf '%s' "${LIST}" | jq -r '.[]? | select(.name|endswith(".tar.gz.enc")) | .name' 2>/dev/null | sort | tail -1)"
-  if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
-    echo "No backup on the 'backups' branch yet - starting fresh."
-    return 0
-  fi
-  echo "Restoring from ${LATEST}"
-
+  local API LIST LATEST WORK ENC RESTORED FAILED UG PTR PD_ID
   ENC="/tmp/restore.enc"
-  if ! curl -sSL --max-time 300 -o "${ENC}" \
-        "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/backups/backups/${LATEST}"; then
-    echo "Backup download failed - continuing without restore."
+
+  # Preferred: a Pixeldrain pointer on the branch (handles big backups).
+  PTR="$(curl -sSL --max-time 30 \
+          "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/backups/backups/latest.txt" 2>/dev/null || true)"
+  PD_ID="$(printf '%s' "${PTR}" | sed -n 's/^pixeldrain_id=//p' | tr -d '\r')"
+  if [ -n "${PD_ID}" ]; then
+    echo "Fetching ${PD_ID} from Pixeldrain"
+    if ! curl -sSL --max-time 1800 -u ":${PIXELDRAIN_API_KEY:-}" -o "${ENC}" \
+          "https://pixeldrain.com/api/file/${PD_ID}"; then
+      echo "Pixeldrain download failed - trying the branch instead."
+      PD_ID=""
+    fi
+  fi
+
+  if [ -z "${PD_ID}" ]; then
+    API="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/backups?ref=backups"
+    LIST="$(curl -sSL --max-time 30 -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+              -H "Accept: application/vnd.github+json" "${API}" 2>/dev/null || true)"
+    LATEST="$(printf '%s' "${LIST}" | jq -r '.[]? | select(.name|endswith(".tar.gz.enc")) | .name' 2>/dev/null | sort | tail -1)"
+    if [ -z "${LATEST}" ] || [ "${LATEST}" = "null" ]; then
+      echo "No backup found yet - starting fresh."
+      return 0
+    fi
+    echo "Restoring from ${LATEST}"
+    if ! curl -sSL --max-time 300 -o "${ENC}" \
+          "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/backups/backups/${LATEST}"; then
+      echo "Backup download failed - continuing without restore."
+      return 0
+    fi
+  fi
+
+  if [ ! -s "${ENC}" ]; then
+    echo "Backup download produced no data - continuing without restore."
     return 0
   fi
 
@@ -314,7 +378,7 @@ restore_latest_backup() {
   if ! openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
         -pass env:BACKUP_PASSWORD -in "${ENC}" | tar -xzf - -C "${WORK}" 2>/dev/null; then
     echo "Decrypt/extract failed - is BACKUP_PASSWORD the same as when it was made?"
-    notify "Cloud Phone: restore failed" "Could not decrypt ${LATEST}. Wrong BACKUP_PASSWORD?" high "x"
+    notify "Cloud Phone: restore failed" "Could not decrypt the backup. Wrong BACKUP_PASSWORD?" high "x"
     rm -rf "${WORK}" "${ENC}"
     return 0
   fi
@@ -367,7 +431,7 @@ restore_latest_backup() {
 
   rm -rf "${WORK}"
   echo "Restore done: ${RESTORED} app(s) installed, ${FAILED} failed."
-  notify "Cloud Phone: restored" "Restored ${RESTORED} app(s) from ${LATEST}." default "inbox_tray"
+  notify "Cloud Phone: restored" "Restored ${RESTORED} app(s)." default "inbox_tray"
   return 0
 }
 
@@ -447,7 +511,34 @@ do_backup() {
   openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
     -pass env:BACKUP_PASSWORD -in "${BUNDLE}" -out "${OUT}"
   SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo 0)
+  echo "Encrypted backup: $(du -h "${OUT}" | cut -f1)"
 
+  # ---- publish: Pixeldrain first (no 100 MB file limit) -------------------
+  if [ -n "${PIXELDRAIN_API_KEY}" ]; then
+    echo "Uploading to Pixeldrain..."
+    PD_ID="$(pixeldrain_upload "${OUT}" || true)"
+    if [ -n "${PD_ID}" ]; then
+      echo "Pixeldrain file id: ${PD_ID}"
+      OLD_ID="$(curl -sSL --max-time 30 \
+        "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/backups/backups/latest.txt" 2>/dev/null \
+        | sed -n 's/^pixeldrain_id=//p' | tr -d '\r' || true)"
+      if write_pointer "${PD_ID}" "${SIZE}" "$(basename "${OUT}")" "${STAMP}"; then
+        echo "Pointer pushed to 'backups'."
+        if [ -n "${OLD_ID}" ] && [ "${OLD_ID}" != "${PD_ID}" ]; then
+          pixeldrain_delete "${OLD_ID}"
+          echo "Deleted previous Pixeldrain file ${OLD_ID} (newest only)."
+        fi
+        notify "Cloud Phone: backup uploaded" "Pixeldrain ${PD_ID} ($(du -h "${OUT}" | cut -f1))." low "floppy_disk"
+        rm -f "${OUT}"
+        rm -rf "${WORK}" "${BUNDLE}"
+        return 0
+      fi
+      echo "Could not push the pointer - the file is still on Pixeldrain."
+    fi
+    echo "Pixeldrain path failed - falling back to the git branch."
+  fi
+
+  # ---- fallback: the 'backups' branch (git rejects files over 100 MB) -----
   # GitHub hard-rejects any file over 100 MB, so an oversized backup can never
   # be pushed - it just fails silently every interval. Apps and their data are
   # the important part, so drop the /sdcard payload first and retry.
@@ -481,7 +572,6 @@ do_backup() {
     rm -f "${OUT}"
     return 0
   fi
-  echo "Encrypted backup: $(du -h "${OUT}" | cut -f1)"
 
   # Publish ONLY the newest snapshot: build a fresh single-file commit and
   # force-push it to the 'backups' branch, so the branch never accumulates.
@@ -567,7 +657,7 @@ echo "#     ${URL}"
 echo "#                                                             #"
 echo "#   Then: click your device, and pick 'proxy over adb'.       #"
 echo "#   Root: adb=${ROOT_OK} su=${SU_OK}  ARM: ${ARM_TRANSLATION}  Screen: ${RESOLUTION}  #"
-echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> branch 'backups'" || echo "off (no BACKUP_PASSWORD)")#"
+echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> $([ -n "${PIXELDRAIN_API_KEY}" ] && echo Pixeldrain || echo branch 'backups')" || echo "off (no BACKUP_PASSWORD)")#"
 echo "#   Stays up for ${DURATION_MIN} minutes.                         #"
 echo "#                                                             #"
 echo "###############################################################"
