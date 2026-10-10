@@ -2,26 +2,30 @@
 #
 # cloud-phone.sh - boot a visual, touch-enabled Android "cloud phone" on a
 # GitHub Actions runner, stream it with scrcpy (H.264) via ws-scrcpy, give it
-# root, and periodically back up user apps (encrypted).
+# root (optional), and periodically back up user apps (encrypted).
 #
 # Everything runs in ONE process tree: GitHub Actions kills background processes
 # when a step ends, so the emulator/server/tunnel live here and the script sleeps.
 #
 set -euo pipefail
 
-API_LEVEL="${API_LEVEL:-33}"
+API_LEVEL="${API_LEVEL:-29}"          # Android 10 by default: light + fast
 ARCH="${ARCH:-x86_64}"
-TARGET="${TARGET:-google_apis_playstore}"
+TARGET="${TARGET:-default}"           # AOSP by default (no Google) for speed
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
-MAX_SIZE="${MAX_SIZE:-640}"
+MAX_SIZE="${MAX_SIZE:-640}"           # scrcpy downscale (lower = smoother)
 WS_PORT="${WS_PORT:-8000}"
-ENABLE_MAGISK="${ENABLE_MAGISK:-1}"
-MAGISK_VER="${MAGISK_VER:-25.2}"
+ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
+MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
 ARM_TRANSLATION="${ARM_TRANSLATION:-0}"
+NTFY_TOPIC="${NTFY_TOPIC:-}"
+NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
+NOTIFY_INTERVAL_MIN="${NOTIFY_INTERVAL_MIN:-30}"
+RESTART_EVERY_MIN="${RESTART_EVERY_MIN:-0}"
 
 # ARM-only apps need the API 30 image, which is the one that ships Google's
 # libndk native bridge. So requesting ARM translation pins the API level.
@@ -38,6 +42,17 @@ export ANDROID_AVD_HOME="$HOME/.android/avd"
 mkdir -p "${ANDROID_USER_HOME}" "${ANDROID_AVD_HOME}"
 
 log() { echo -e "\n=== $* ==="; }
+
+# ntfy notification. No-op unless NTFY_TOPIC is set.
+# $1 title, $2 message, $3 priority (min|low|default|high|max), $4 tags
+notify() {
+  [ -n "${NTFY_TOPIC}" ] || return 0
+  curl -s --max-time 10 \
+    -H "Title: ${1}" \
+    -H "Priority: ${3:-default}" \
+    -H "Tags: ${4:-robot}" \
+    -d "${2}" "${NTFY_SERVER}/${NTFY_TOPIC}" >/dev/null 2>&1 || true
+}
 
 start_emulator() {
   emulator -avd "${AVD_NAME}" \
@@ -61,6 +76,7 @@ is_root() {
 }
 
 # ---------------------------------------------------------------------------
+notify "Cloud Phone: starting" "Job started. Provisioning Android ${API_LEVEL} (${TARGET})." low "hourglass"
 log "Freeing disk space"
 sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
@@ -101,6 +117,7 @@ fi
 echo "AVDs seen by emulator:"; emulator -list-avds || true
 if ! emulator -list-avds | grep -qx "${AVD_NAME}"; then
   echo "ERROR: AVD '${AVD_NAME}' was not registered. Aborting."
+  notify "Cloud Phone: FAILED" "AVD was not registered." high "x"
   exit 1
 fi
 
@@ -110,10 +127,12 @@ start_emulator
 sleep 5
 if ! kill -0 "${EMU_PID}" 2>/dev/null; then
   echo "ERROR: the emulator process exited immediately after launch."
+  notify "Cloud Phone: FAILED" "Emulator exited immediately after launch." high "x"
   exit 1
 fi
 wait_boot || exit 1
 echo "Emulator booted."
+notify "Cloud Phone: VM started" "Android ${API_LEVEL} (${TARGET}) emulator booted on the runner." default "phone"
 
 log "Device ABI support (decides whether ARM-only APKs can install)"
 for p in ro.product.cpu.abilist ro.product.cpu.abilist64 ro.product.cpu.abilist32 \
@@ -122,7 +141,7 @@ for p in ro.product.cpu.abilist ro.product.cpu.abilist64 ro.product.cpu.abilist3
 done
 
 # ---------------------------------------------------------------------------
-log "Root: 'adb root' (works on google_apis, refused on playstore images)"
+log "Root: 'adb root' (works on google_apis/default, refused on playstore images)"
 adb root >/dev/null 2>&1 || true
 sleep 3
 ROOT_OK=0
@@ -171,6 +190,7 @@ if [ "${ENABLE_MAGISK}" = "1" ]; then
     echo "Reboot after Magisk failed; continuing with what we have."
   fi
   echo "root after Magisk step: adb=${ROOT_OK} su=${SU_OK}"
+  notify "Cloud Phone: root" "Magisk step done - adb=${ROOT_OK} su=${SU_OK}" low "key"
 fi
 
 # ---------------------------------------------------------------------------
@@ -253,6 +273,7 @@ do_backup() {
       || echo "Backup push failed (needs 'contents: write' permission)."
   )
   rm -f "${OUT}"
+  notify "Cloud Phone: backup pushed" "Encrypted snapshot pushed to branch 'backups' (newest only)." low "floppy_disk"
   return 0
 }
 
@@ -277,6 +298,7 @@ sleep 8
 if ! kill -0 "${WSS_PID}" 2>/dev/null; then
   echo "ws-scrcpy server exited immediately. Log follows:"
   cat /tmp/ws-scrcpy.log
+  notify "Cloud Phone: FAILED" "ws-scrcpy server exited immediately." high "x"
   exit 1
 fi
 curl -s -o /dev/null -w "ws-scrcpy HTTP status: %{http_code}\n" "http://localhost:${WS_PORT}/" || true
@@ -299,6 +321,7 @@ done
 if [ -z "${URL}" ]; then
   echo "Could not obtain a tunnel URL. cloudflared log follows:"
   cat /tmp/cloudflared.log
+  notify "Cloud Phone: FAILED" "Could not obtain a tunnel URL." high "x"
   exit 1
 fi
 
@@ -318,19 +341,50 @@ echo "#                                                             #"
 echo "###############################################################"
 echo ""
 
+notify "Cloud Phone is LIVE" "URL: ${URL}
+API ${API_LEVEL} / ${TARGET}
+Root: adb=${ROOT_OK} su=${SU_OK}
+Session: ${DURATION_MIN} min" high "rocket"
+
 # ---------------------------------------------------------------------------
 log "Keeping the phone alive for ${DURATION_MIN} minutes"
 NOW="$(date +%s)"
 END=$(( NOW + DURATION_MIN * 60 ))
-NEXT_BACKUP=$(( NOW + 60 ))
+NEXT_BACKUP=$(( NOW + 60 ))   # first backup ~1 min in, then every interval
+NEXT_NOTIFY=$(( NOW + NOTIFY_INTERVAL_MIN * 60 ))
+NEXT_RESTART=$(( NOW + RESTART_EVERY_MIN * 60 ))
 while [ "$(date +%s)" -lt "${END}" ]; do
   if ! kill -0 "${EMU_PID}" 2>/dev/null; then
     echo "Emulator process exited - stopping."
+    notify "Cloud Phone DIED" "The emulator exited unexpectedly." high "warning"
     break
   fi
-  if [ -n "${BACKUP_PASSWORD}" ] && [ "$(date +%s)" -ge "${NEXT_BACKUP}" ]; then
+  TS="$(date +%s)"
+  if [ -n "${BACKUP_PASSWORD}" ] && [ "${TS}" -ge "${NEXT_BACKUP}" ]; then
     do_backup || echo "Backup attempt failed; will retry next interval."
     NEXT_BACKUP=$(( $(date +%s) + BACKUP_INTERVAL_MIN * 60 ))
+  fi
+  if [ "${TS}" -ge "${NEXT_NOTIFY}" ]; then
+    LEFT=$(( (END - TS) / 60 ))
+    UPTIME=$(( (TS - NOW) / 60 ))
+    APPS=$(adb shell pm list packages -3 2>/dev/null | wc -l)
+    MEM=$(adb shell cat /proc/meminfo 2>/dev/null | awk '/MemAvailable/{print int($2/1024)" MB"}')
+    if [ -n "${BACKUP_PASSWORD}" ]; then NB="$(( (NEXT_BACKUP - TS) / 60 )) min"; else NB="n/a"; fi
+    notify "Cloud Phone status" "Remaining: ${LEFT} min (of ${DURATION_MIN})
+Uptime: ${UPTIME} min
+User apps: ${APPS}
+Free RAM: ${MEM}
+Root: adb=${ROOT_OK} su=${SU_OK}
+Next backup in: ${NB}" default "bar_chart"
+    NEXT_NOTIFY=$(( TS + NOTIFY_INTERVAL_MIN * 60 ))
+  fi
+  if [ "${RESTART_EVERY_MIN}" -gt 0 ] && [ "${TS}" -ge "${NEXT_RESTART}" ]; then
+    notify "Cloud Phone restarting" "Scheduled emulator reboot now (every ${RESTART_EVERY_MIN} min)." default "arrows_counterclockwise"
+    adb reboot >/dev/null 2>&1 || true
+    sleep 20
+    wait_boot || echo "Scheduled reboot failed."
+    notify "Cloud Phone back up" "Emulator rebooted and back online." default "white_check_mark"
+    NEXT_RESTART=$(( $(date +%s) + RESTART_EVERY_MIN * 60 ))
   fi
   sleep 30
 done
@@ -340,4 +394,5 @@ if [ -n "${BACKUP_PASSWORD}" ]; then
   do_backup || echo "Final backup failed."
 fi
 
+notify "Cloud Phone ended" "Session finished." default "checkered_flag"
 echo "Session finished."
