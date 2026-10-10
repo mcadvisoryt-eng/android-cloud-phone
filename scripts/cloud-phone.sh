@@ -30,6 +30,7 @@ ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
 BACKUP_PASSWORD="${BACKUP_PASSWORD:-}"
 BACKUP_INTERVAL_MIN="${BACKUP_INTERVAL_MIN:-15}"
+BACKUP_MAX_MB="${BACKUP_MAX_MB:-90}"   # git rejects files over 100 MB - stay under it
 ARM_TRANSLATION="${ARM_TRANSLATION:-0}"
 NTFY_TOPIC="${NTFY_TOPIC:-}"
 NTFY_SERVER="${NTFY_SERVER:-https://ntfy.sh}"
@@ -395,7 +396,7 @@ backup_one_app() {
 # ---------------------------------------------------------------------------
 do_backup() {
   [ -n "${BACKUP_PASSWORD}" ] || { echo "No BACKUP_PASSWORD set - skipping backup."; return 0; }
-  local WORK OUT BUNDLE STAMP
+  local WORK OUT BUNDLE STAMP SIZE MAX_BYTES
   WORK="$(mktemp -d)"
   STAMP="$(date -u +%Y%m%d-%H%M%S)"
   echo "Backing up user apps (root=${ROOT_OK}) at ${STAMP}"
@@ -439,10 +440,30 @@ do_backup() {
   echo "Backup contents: ${APP_COUNT} user app(s), /sdcard ${SDCARD_BYTES} bytes"
 
   BUNDLE="/tmp/cloudphone-bundle.tar.gz"
-  tar -czf "${BUNDLE}" -C "${WORK}" .
   OUT="/tmp/cloudphone-backup-${STAMP}.tar.gz.enc"
+  MAX_BYTES=$(( BACKUP_MAX_MB * 1024 * 1024 ))
+
+  tar -czf "${BUNDLE}" -C "${WORK}" .
   openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
     -pass env:BACKUP_PASSWORD -in "${BUNDLE}" -out "${OUT}"
+  SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo 0)
+
+  # GitHub hard-rejects any file over 100 MB, so an oversized backup can never
+  # be pushed - it just fails silently every interval. Apps and their data are
+  # the important part, so drop the /sdcard payload first and retry.
+  if [ "${SIZE}" -gt "${MAX_BYTES}" ] && [ -f "${WORK}/sdcard.tar.gz" ]; then
+    echo "Backup is $(du -h "${OUT}" | cut -f1) - over the ${BACKUP_MAX_MB} MB git limit; dropping /sdcard files, keeping apps + app data."
+    rm -f "${WORK}/sdcard.tar.gz" "${BUNDLE}" "${OUT}"
+    tar -czf "${BUNDLE}" -C "${WORK}" .
+    openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+      -pass env:BACKUP_PASSWORD -in "${BUNDLE}" -out "${OUT}"
+    SIZE=$(stat -c %s "${OUT}" 2>/dev/null || echo 0)
+  fi
+  if [ "${SIZE}" -gt "${MAX_BYTES}" ]; then
+    echo "Backup is still $(du -h "${OUT}" | cut -f1) - too large to push to git. Keeping the existing backup."
+    rm -rf "${WORK}" "${BUNDLE}" "${OUT}"
+    return 0
+  fi
   rm -rf "${WORK}" "${BUNDLE}"
 
   # Safety net: never replace an existing backup with one less than half its
@@ -475,11 +496,11 @@ do_backup() {
     cp "${OUT}" "backups/$(basename "${OUT}")"
     git add -f "backups/$(basename "${OUT}")"
     git commit -m "Encrypted cloud phone backup ${STAMP} (latest only)" >/dev/null 2>&1 || true
-    git push -f origin "HEAD:refs/heads/backups" >/dev/null 2>&1
-  ) && {
+    git push -f origin "HEAD:refs/heads/backups"
+  ) >/tmp/push.log 2>&1 && {
     echo "Backup pushed to 'backups' (latest only)."
     notify "Cloud Phone: backup pushed" "Encrypted snapshot pushed to branch 'backups' (newest only)." low "floppy_disk"
-  } || echo "Backup push failed (needs 'contents: write' permission)."
+  } || { echo "Backup push failed. git said:"; tail -4 /tmp/push.log; }
   rm -f "${OUT}"
   return 0
 }
