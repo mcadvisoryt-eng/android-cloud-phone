@@ -15,7 +15,10 @@ TARGET="${TARGET:-google_apis}"       # Google APIs, no Play Store: lighter than
 DURATION_MIN="${DURATION_MIN:-300}"
 DEVICE="${DEVICE:-pixel_2}"
 AVD_NAME="cloudphone"
-MAX_SIZE="${MAX_SIZE:-640}"           # scrcpy downscale (lower = smoother)
+MAX_SIZE="${MAX_SIZE:-540}"           # scrcpy downscale (lower = smoother)
+RESOLUTION="${RESOLUTION:-540x960}"   # device screen: fewer pixels = much smoother
+RAM_MB="${RAM_MB:-4096}"              # emulator RAM in MB (the runner has 16 GB)
+CORES="${CORES:-4}"                   # emulator CPU cores (the runner has 4 vCPU)
 WS_PORT="${WS_PORT:-8000}"
 ENABLE_MAGISK="${ENABLE_MAGISK:-0}"   # root is optional, off by default
 MAGISK_VER="${MAGISK_VER:-25.2}"      # < 26 so rootAVD can patch non-interactively
@@ -35,6 +38,12 @@ if [ "${ARM_TRANSLATION}" = "1" ] && [ "${API_LEVEL}" != "30" ]; then
   echo "NOTE: ARM translation needs the API 30 image - overriding API level ${API_LEVEL} -> 30"
   API_LEVEL=30
 fi
+
+# Derive the screen density from the width so the UI scales sanely
+# (540->240, 720->320, 1080->480).
+SCREEN_W="${RESOLUTION%x*}"
+SCREEN_H="${RESOLUTION#*x}"
+DENSITY="${DENSITY:-$(( SCREEN_W * 100 / 225 ))}"
 
 export ANDROID_HOME="$HOME/android-sdk"
 export ANDROID_SDK_ROOT="${ANDROID_HOME}"
@@ -60,6 +69,7 @@ start_emulator() {
   emulator -avd "${AVD_NAME}" \
     -no-window -no-audio -no-boot-anim -no-snapshot -no-metrics \
     -gpu swiftshader_indirect \
+    -memory "${RAM_MB}" -cores "${CORES}" \
     -camera-back none -camera-front none \
     -netdelay none -netspeed full &
   EMU_PID=$!
@@ -107,6 +117,9 @@ $(printf '%s' "${NEW}" | tail -12)" high "boom"
 
 # ---------------------------------------------------------------------------
 notify "Cloud Phone: starting" "Job started. Provisioning Android ${API_LEVEL} (${TARGET})." low "hourglass"
+log "Runner resources"
+echo "vCPU: $(nproc)"
+free -m | awk 'NR==2{print "RAM: total "$2" MB, available "$7" MB"}'
 log "Freeing disk space"
 sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
@@ -141,7 +154,8 @@ echo "no" | avdmanager create avd \
 AVD_INI="${ANDROID_AVD_HOME}/${AVD_NAME}.avd/config.ini"
 if [ -f "${AVD_INI}" ]; then
   sed -i '/^hw\.lcd\.width=/d; /^hw\.lcd\.height=/d; /^hw\.lcd\.density=/d' "${AVD_INI}"
-  printf 'hw.lcd.width=720\nhw.lcd.height=1280\nhw.lcd.density=320\n' >> "${AVD_INI}"
+  printf 'hw.lcd.width=%s\nhw.lcd.height=%s\nhw.lcd.density=%s\n' \
+    "${SCREEN_W}" "${SCREEN_H}" "${DENSITY}" >> "${AVD_INI}"
 fi
 
 echo "AVDs seen by emulator:"; emulator -list-avds || true
@@ -162,7 +176,15 @@ if ! kill -0 "${EMU_PID}" 2>/dev/null; then
 fi
 wait_boot || exit 1
 echo "Emulator booted."
-notify "Cloud Phone: VM started" "Android ${API_LEVEL} (${TARGET}) emulator booted on the runner." default "phone"
+
+# Software rendering is the bottleneck, so turn off the animation overhead.
+log "Tuning the device for smoothness"
+for s in window_animation_scale transition_animation_scale animator_duration_scale; do
+  adb shell settings put global "$s" 0 >/dev/null 2>&1 || true
+done
+echo "  animations disabled; screen ${SCREEN_W}x${SCREEN_H} @ ${DENSITY}dpi; ${RAM_MB} MB RAM, ${CORES} cores"
+notify "Cloud Phone: VM started" "Android ${API_LEVEL} (${TARGET}) emulator booted.
+Screen ${SCREEN_W}x${SCREEN_H} @${DENSITY}dpi, ${RAM_MB} MB RAM, ${CORES} cores." default "phone"
 
 log "Device ABI support (decides whether ARM-only APKs can install)"
 for p in ro.product.cpu.abilist ro.product.cpu.abilist64 ro.product.cpu.abilist32 \
@@ -370,7 +392,7 @@ echo "#   Open this in your browser:                                #"
 echo "#     ${URL}"
 echo "#                                                             #"
 echo "#   Then: click your device, and pick 'proxy over adb'.       #"
-echo "#   Root: adb=${ROOT_OK} su=${SU_OK}  ARM translation: ${ARM_TRANSLATION}   #"
+echo "#   Root: adb=${ROOT_OK} su=${SU_OK}  ARM: ${ARM_TRANSLATION}  Screen: ${RESOLUTION}  #"
 echo "#   Backup: $([ -n "${BACKUP_PASSWORD}" ] && echo "on, every ${BACKUP_INTERVAL_MIN} min -> branch 'backups'" || echo "off (no BACKUP_PASSWORD)")#"
 echo "#   Stays up for ${DURATION_MIN} minutes.                         #"
 echo "#                                                             #"
@@ -379,6 +401,7 @@ echo ""
 
 notify "Cloud Phone is LIVE" "URL: ${URL}
 API ${API_LEVEL} / ${TARGET}
+Screen: ${RESOLUTION}
 Root: adb=${ROOT_OK} su=${SU_OK}
 Session: ${DURATION_MIN} min" high "rocket"
 
