@@ -64,7 +64,7 @@ on:
         required: true
         default: "com.android.vending com.android.chrome"
       backup_max_mb:
-        description: "Max backup size in MB before /sdcard files are dropped (git rejects >100)"
+        description: "Max size in MB before /sdcard is dropped from the git fallback (git rejects >100)"
         required: true
         default: "90"
 
@@ -116,6 +116,10 @@ jobs:
           BACKUP_PASSWORD: ${{ secrets.BACKUP_PASSWORD }}
           BACKUP_INTERVAL_MIN: "15"
           BACKUP_MAX_MB: ${{ inputs.backup_max_mb }}
+          # Optional. Add a repo secret named PIXELDRAIN_API_KEY and backups go
+          # there (no 100 MB limit, so /sdcard files are included) with only a
+          # small pointer kept on the 'backups' branch.
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
           # ntfy notifications. Add a repo secret named NTFY_TOPIC (your topic).
           # Optional: NTFY_SERVER for a self-hosted ntfy (defaults to ntfy.sh).
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
