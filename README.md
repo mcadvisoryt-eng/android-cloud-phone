@@ -1,77 +1,99 @@
 # Cloud Phone
 
-Spin up a **visual, touch-enabled, rooted Android phone** on a free GitHub
-Actions runner, control it from any browser, and have it **automatically back up
-your apps and their data** - encrypted - to this repo. Throw it away when done.
+Spin up a **visual, touch-enabled Android phone** on a free GitHub Actions
+runner, control it from any browser, and get **ntfy notifications** about what
+it's doing. Light by default; add Google services, root, or backups only if you
+want them.
 
 Streaming uses **scrcpy (H.264)** via [ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy),
-not VNC. H.264 video is what gives smooth playback; VNC's screen-update protocol
-is choppy for a live phone.
+not VNC. H.264 video is what gives smooth playback.
 
 ---
 
-## Before you start
+## Secrets (all optional, but recommended)
 
-**Add a repo secret called `BACKUP_PASSWORD`.** Settings -> Secrets and variables
--> Actions -> New repository secret. The backup is AES-256 encrypted with this
-password; without it, backups are skipped (everything else still works). Only you
-know the password - keep it safe, or the backup is unrecoverable.
+Settings -> Secrets and variables -> Actions -> New repository secret.
+
+| Secret | What it does |
+|---|---|
+| `NTFY_TOPIC` | Your [ntfy](https://ntfy.sh) topic. Enables all notifications. |
+| `NTFY_SERVER` | Optional. A self-hosted ntfy server (defaults to `https://ntfy.sh`). |
+| `BACKUP_PASSWORD` | Enables the encrypted app-data backup (AES-256). |
+
+Subscribe to your topic in the ntfy app (or open `https://ntfy.sh/<topic>`) and
+you'll get push messages for the events below.
 
 ---
 
-## Which image? (this is the important one)
+## Defaults (deliberately light)
 
-The default is **`google_apis_playstore`** - Android with **Google Play Services
-and the Play Store**. This matters more than anything else for "do my apps work":
+| Setting | Default | Why |
+|---|---|---|
+| `api_level` | **29** (Android 10) | Far lighter than 33; boots faster, runs smoother. Use `24` (Android 7) for even less. |
+| `target` | **`default`** (AOSP) | No Google services = no bloat, fastest boot. |
+| `magisk` | **`no`** | Root is optional; skip it and the run is quicker. |
+| `arm_translation` | **`no`** | Only needed for ARM-only APKs. |
 
-- Apps that use Google sign-in, Maps, Firebase, push notifications, ads, or the
-  Play Billing library **crash or hang on startup without Play Services**. The
-  `google_apis` image lacks them.
-- **ARM-only apps need the API 30 image.** The Android 11 (API 30)
-  `google_apis_playstore` image ships Google's **libndk** native bridge and
-  advertises `arm64-v8a` / `armeabi-v7a`, so ARM-only APKs install and run. Newer
-  images such as API 33 do **not** include it, and ARM-only APKs fail there with
-  *"App not installed as app isn't compatible with your phone"*. Set
-  **arm_translation: yes** to force API 30 for this.
+Add Google services by choosing `google_apis` (Google APIs) or
+`google_apis_playstore` (Play Store + Play Services) - needed if apps use Google
+sign-in, Firebase, push notifications, ads, or Play Billing.
 
-**The trade-off:** Play Store images are production builds, so `adb root` is
-*refused*. On that image root comes from **Magisk** only. If Magisk fails, the
-phone still works but the encrypted backup can't read private app data.
+---
+
+## Notifications (ntfy)
+
+Set `NTFY_TOPIC` and the script pushes a notification for:
+
+- **Starting** - job began, with the Android version and image.
+- **VM started** - the emulator booted.
+- **LIVE** - the phone is up, including its URL and session length.
+- **Root** - result of the optional Magisk step (`adb=... su=...`).
+- **Backup pushed** - an encrypted snapshot landed on the `backups` branch.
+- **Status** - every `NOTIFY_INTERVAL_MIN` (default 30): **remaining time**,
+  uptime, user-app count, free RAM, root state, and **time until the next
+  backup**.
+- **Restarting / back up** - only if `RESTART_EVERY_MIN` is set (default 0 = off);
+  reboots the emulator on a schedule and tells you.
+- **DIED** - the emulator exited unexpectedly.
+- **Ended** - the session finished.
+
+Tune the cadence with `NOTIFY_INTERVAL_MIN` and enable scheduled reboots with
+`RESTART_EVERY_MIN` (both in the workflow's `env:`).
 
 ---
 
 ## How to use it
 
 1. **Actions** tab -> **Cloud Phone** -> **Run workflow**.
-2. Set the inputs:
-   - **api_level** - `30` for ARM-only apps, otherwise `33`.
-   - **duration_minutes** - default `300`; hard cap ~`340`.
-   - **target** - `google_apis_playstore` (default, apps work), `google_apis`
-     (guaranteed `adb root`, no Play Services), or `default`.
-   - **magisk** - `yes`/`no`.
-   - **arm_translation** - `yes` to force API 30 so arm64-only APKs run.
-3. Wait ~15-20 minutes.
+2. Set the inputs (defaults are fine for a light, fast phone).
+3. Wait ~10-15 minutes (less than before - no Google image, no root step).
 4. In the job log, find the banner:
    ```
    #   YOUR CLOUD PHONE IS LIVE  (scrcpy / H.264)
-   #   Open this in your browser:
    #     https://<random>.trycloudflare.com
    ```
 5. Open it, **click your device, and pick `proxy over adb`**. Mouse/tap = touch.
-6. Install/log in, use the phone, then **cancel the run** when done.
+6. When done, **cancel the run**.
+
+---
+
+## ARM-only apps
+
+Some apps (e.g. MovieBox) ship only `arm64-v8a` libraries and refuse to install
+on an x86_64 emulator. The **API 30** image ships Google's **libndk** native
+bridge, so they work there - set **arm_translation: yes** (which forces API 30).
+API 33 and newer do **not** include it, and such apps fail with *"app isn't
+compatible with your phone"*.
 
 ---
 
 ## Backups
 
-- Every **15 minutes** (`BACKUP_INTERVAL_MIN`) the phone snapshots all
-  **user-installed apps** - each APK plus its private data
-  (`/data/user/0/<pkg>`, where browser cookies, saved logins and profiles live).
+- Every **15 minutes** the phone snapshots all **user-installed apps** - APK plus
+  private data (`/data/user/0/<pkg>`, where browser cookies and saved logins
+  live). Private data needs root; without it only APKs are captured.
 - Encrypted with **AES-256-CBC** using `BACKUP_PASSWORD`.
-- Force-pushed to the **`backups`** branch, which keeps **only the newest**
-  snapshot (a fresh single-file commit replaces the branch each time).
-
-Decrypt with:
+- Force-pushed to the **`backups`** branch, keeping **only the newest** snapshot.
 
 ```bash
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
@@ -79,46 +101,33 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
 tar -xzf backup.tar.gz
 ```
 
-**Honest caveat:** restoring onto a *different* device is not always clean -
-Chrome sync tokens and some app data are bound to the device keychain. Treat this
-as a capture you can inspect and partially restore, not a guaranteed restore.
+**Caveat:** restoring onto a *different* device is not always clean - some app
+data is bound to the device keychain.
 
 ---
 
-## Root
+## Root (optional)
 
-- **`adb root`** - works on `google_apis`; refused on Play Store images.
-- **Magisk** via [rootAVD](https://github.com/newbit1/rootAVD), pinned to
-  **Magisk 25.2** (Magisk 26+ needs the manual "FAKEBOOTIMG" tap and cannot run
-  unattended).
-
-Magisk is **best-effort** - if it fails the run continues. Check the log line
-`root after Magisk step: adb=... su=...`.
-
-**KernelSU is not possible here** - it's kernel-based and needs a custom kernel
-compiled with KernelSU; none is published for the Android emulator.
+- On `default` / `google_apis` images, **`adb root`** just works.
+- **Magisk** (via [rootAVD](https://github.com/newbit1/rootAVD), pinned to 25.2)
+  is best-effort and off by default. **KernelSU is not possible** - it needs a
+  custom kernel that isn't published for the emulator.
 
 ---
 
-## Tuning
-
-In `scripts/cloud-phone.sh`:
+## Tuning (in `scripts/cloud-phone.sh`)
 
 - `MAX_SIZE` (default `640`) - scrcpy downscale. Biggest lever on frame rate.
 - `hw.lcd.*` - the phone's framebuffer (720x1280).
-- `BACKUP_INTERVAL_MIN` (default `15`).
-- `MAGISK_VER` - must be `< 26` to stay unattended.
+- `NOTIFY_INTERVAL_MIN`, `RESTART_EVERY_MIN`, `BACKUP_INTERVAL_MIN`.
 
 ---
 
 ## Limits
 
-- **It's temporary.** The phone vanishes when the run ends; only the encrypted
-  backup persists.
+- **Temporary.** The phone vanishes when the run ends.
 - **No SIM.** No calls or SMS.
 - **2 vCPUs, no GPU** - software rendering is the ceiling on frame rate.
-- **ARM-only apps:** use **API 30** (set `arm_translation: yes`), which ships
-  libndk translation. API 33 and newer do not, so ARM-only apps fail there.
-- **GitHub Actions is a CI system.** Keep personal sessions short.
+- **GitHub Actions is a CI system.** Keep sessions short.
 - **The tunnel is public while it runs**, and the repo is public - the backup is
-  protected *only* by your `BACKUP_PASSWORD`. Use a strong one.
+  protected *only* by `BACKUP_PASSWORD`.
