@@ -1,6 +1,6 @@
 name: Cloud Phone
 
-# Manual trigger only - nothing runs until you press the button.
+# Two ways to start: press Run (workflow_dispatch), or let the schedule do it.
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +11,7 @@ on:
       duration_minutes:
         description: "How long to keep the phone alive (minutes, max ~340)"
         required: true
-        default: "300"
+        default: "330"
       target:
         description: "System image. google_apis = root + ARM + Play Services (recommended)"
         required: true
@@ -67,6 +67,20 @@ on:
         description: "Max size in MB before /sdcard is dropped from the git fallback (git rejects >100)"
         required: true
         default: "90"
+
+  # Start by itself - no button press. Times are UTC (IST = UTC+5:30, so
+  # 00:00 UTC = 05:30 IST). A scheduled run always uses the defaults above;
+  # edit this cron to change the cadence. GitHub often delays scheduled runs
+  # by a few minutes when its queues are busy.
+  schedule:
+    - cron: "0 */6 * * *"
+
+# Only one cloud phone at a time. A run that fires while another is still live
+# WAITS instead of booting a second phone that would fight over the same
+# backup. To start a fresh phone immediately, cancel the running one first.
+concurrency:
+  group: cloud-phone
+  cancel-in-progress: false
 
 # Needed so the script can push the encrypted backup to the 'backups' branch.
 permissions:
