@@ -13,13 +13,13 @@ on:
         required: true
         default: "330"
       target:
-        description: "System image. google_apis = root + ARM + Play Services (recommended)"
+        description: "System image. google_apis_playstore = Play Store + ARM (no root, so no app data in backups)"
         required: true
-        default: "google_apis"
+        default: "google_apis_playstore"
         type: choice
         options:
-          - google_apis
           - google_apis_playstore
+          - google_apis
           - google_atd
           - aosp_atd
           - default
@@ -121,8 +121,9 @@ jobs:
           # Internal storage (/data). Stock AVD gives ~1-2 GB, which is unusable.
           STORAGE: ${{ inputs.storage }}
           RESTORE: ${{ inputs.restore == 'yes' && '1' || '0' }}
-          # System apps whose data should survive between sessions
-          # (Play Store = your Google sign-in, Chrome = bookmarks/history).
+          # System apps whose data should survive between sessions. Note: their
+          # DATA needs root, which Play Store images refuse - so on those images
+          # this only preserves their updated APKs.
           SYSTEM_APPS: ${{ inputs.system_apps }}
           # Needed to read the latest backup back from the 'backups' branch.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
